@@ -62,6 +62,14 @@ done
 if [ "${CODE_SIGNING_ALLOWED:-NO}" != NO ]; then
     /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --options runtime --timestamp=none "$ldac_audio"
 fi
+ldac_team="${DEVELOPMENT_TEAM:-5743Y47SC7}"
+case "$ldac_team" in
+    [ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]) ;;
+    *)
+        printf '%s\n' 'DEVELOPMENT_TEAM must be a 10-character Apple team ID to build the LDAC output driver.' >&2
+        exit 1
+        ;;
+esac
 ldac_driver="$ldac_helpers/AcoupletLDACOutput.driver"
 mkdir -p "$ldac_driver/Contents/MacOS" "$ldac_driver/Contents/Resources"
 /bin/cp "$ldac_source/VirtualOutput/Info.plist" "$ldac_driver/Contents/Info.plist"
@@ -71,7 +79,7 @@ mkdir -p "$ldac_driver/Contents/MacOS" "$ldac_driver/Contents/Resources"
 /bin/cp "$ldac_source/VirtualOutput/LICENSE.txt" "$ldac_driver/Contents/Resources/LICENSE.txt"
 /bin/cp "$ldac_source/VirtualOutput/Resources/Headphones.png" "$ldac_source/VirtualOutput/Resources/Earbuds.png" "$ldac_source/VirtualOutput/Resources/Speaker.png" "$ldac_driver/Contents/Resources/"
 "$ldac_clang" $ldac_arch_flags -isysroot "$ldac_sdk" "-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET:-15.4}" -std=gnu11 -O2 -fblocks -Werror -bundle \
-    -framework CoreAudio -framework CoreFoundation -framework Security "$ldac_source/VirtualOutput/AcoupletVirtualOutput.c" \
+    "-DACOUPLET_SIGNING_TEAM=\"$ldac_team\"" -framework CoreAudio -framework CoreFoundation -framework Security "$ldac_source/VirtualOutput/AcoupletVirtualOutput.c" \
     -o "$ldac_driver/Contents/MacOS/AcoupletVirtualOutput"
 if [ "${CODE_SIGNING_ALLOWED:-NO}" != NO ]; then
     ldac_timestamp=--timestamp=none

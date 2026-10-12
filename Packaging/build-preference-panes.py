@@ -51,7 +51,8 @@ def build(repo, manifest, output, identity, team, version):
                         CFBundleName=label, CFBundleDisplayName=label, CFBundleVersion=version,
                         CFBundleIconFile=icon, NSPrefPaneIconFile=icon, NSPrefPaneIconLabel=label,
                         NSPrincipalClass=principal_name, SonyDeviceAddress=device['address'],
-                        SonyDeviceModelName=device['modelName'], SonyDeviceSystemSymbol=device['systemSymbol'])
+                        SonyDeviceModelName=device['modelName'], SonyDeviceSystemSymbol=device['systemSymbol'],
+                        AcoupletAppTeam=team)
             (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
             slices = []
             for architecture in ('arm64', 'x86_64'):

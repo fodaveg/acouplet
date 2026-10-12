@@ -10,6 +10,12 @@
 #include <Security/Security.h>
 #include "NullAudio.c"
 
+// Team that must sign the Acouplet app before the driver accepts its commands. Packaging/build-ldac.sh
+// passes the build's DEVELOPMENT_TEAM; other builds keep the original team.
+#ifndef ACOUPLET_SIGNING_TEAM
+#define ACOUPLET_SIGNING_TEAM "5743Y47SC7"
+#endif
+
 enum { kAcoupletLease = 'xmls', kAcoupletModel = 'xmnm', kAcoupletPriority = 'xmpr', kAcoupletRevision = 'xmvr' };
 static const SInt32 kAcoupletDriverRevision = 5;
 static UInt64 gLeaseDeadline;
@@ -89,7 +95,7 @@ static Boolean AcoupletClientAuthorized(pid_t client) {
     static dispatch_once_t once;
     static SecRequirementRef requirement;
     dispatch_once(&once, ^{
-        SecRequirementCreateWithString(CFSTR("anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"5743Y47SC7\""),
+        SecRequirementCreateWithString(CFSTR("anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"" ACOUPLET_SIGNING_TEAM "\""),
             kSecCSDefaultFlags, &requirement);
     });
     if (!requirement) return false;

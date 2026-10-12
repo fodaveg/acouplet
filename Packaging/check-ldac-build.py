@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='acouplet-ldac-build-check-') as directo
                    'CONFIGURATION': 'Release', 'ACOUPLET_PUBLIC_APIS_ONLY': 'NO', 'CURRENT_PROJECT_VERSION': '245',
                    'CODE_SIGNING_ALLOWED': 'YES', 'EXPANDED_CODE_SIGN_IDENTITY': 'fixture Apple certificate',
                    'EXPANDED_CODE_SIGN_IDENTITY_NAME': 'Apple Development: Fixture (ABCDEFGHIJ)',
-                   'ACOUPLET_LDAC_CHECK_LOG': str(log)}
+                   'DEVELOPMENT_TEAM': '', 'ACOUPLET_LDAC_CHECK_LOG': str(log)}
     subprocess.run(['/bin/sh', str(script)], env=environment, check=True)
     app = root / 'Fixture.app/Contents'
     names = ['LDACSignaling', 'LDACMediaTransport', 'SonyAudioConnection', 'LDACLogObserver', 'Acouplet Audio.app', 'AcoupletLDACOutput.driver']
@@ -96,6 +96,8 @@ with tempfile.TemporaryDirectory(prefix='acouplet-ldac-build-check-') as directo
     assert '-bundle' in driver_compile and '-std=gnu11' in driver_compile and '-Werror' in driver_compile
     assert 'Security' in [driver_compile[i + 1] for i, arg in enumerate(driver_compile) if arg == '-framework']
     assert any(arg.endswith('/VirtualOutput/AcoupletVirtualOutput.c') for arg in driver_compile)
+    assert '-DACOUPLET_SIGNING_TEAM="5743Y47SC7"' in driver_compile
+    assert not any('ACOUPLET_SIGNING_TEAM' in arg for command in compiles[:-1] for arg in command)
     assert Path(signs[-1][-1]) == driver
     assert '--timestamp=none' in signs[-1]
     for command in signs:
@@ -107,6 +109,14 @@ with tempfile.TemporaryDirectory(prefix='acouplet-ldac-build-check-') as directo
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     signs = [command for command in commands if command[0] == 'codesign']
     assert '--timestamp' in signs[-1] and '--timestamp=none' not in signs[-1]
+    subprocess.run(['/bin/sh', str(script)], env={**environment, 'DEVELOPMENT_TEAM': 'ABCDE12345'}, check=True)
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert '-DACOUPLET_SIGNING_TEAM="ABCDE12345"' in [command for command in commands if command[0] == 'clang'][-1]
+    for team in ('abcde12345', 'ABCDE1234', 'ABCDE12345"', 'ABCDE 2345'):
+        before = log.read_bytes()
+        failed = subprocess.run(['/bin/sh', str(script)], env={**environment, 'DEVELOPMENT_TEAM': team}, capture_output=True)
+        assert failed.returncode != 0 and b'DEVELOPMENT_TEAM' in failed.stderr, team
+        assert not any('AcoupletVirtualOutput.c' in line for line in log.read_bytes()[len(before):].decode().splitlines()), team
     previous_log = log.read_bytes()
     for exclusion in ({'ACOUPLET_PUBLIC_APIS_ONLY': 'YES'}, {'CONFIGURATION': 'AppStore'}):
         for name in names:
