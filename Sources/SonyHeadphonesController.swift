@@ -391,6 +391,18 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             && [playback.statusQueryPayload, playback.musicVolumeQueryPayload]
                 .allSatisfy { playbackReads[$0] == nil && !queuedPlaybackQueries.contains($0) }
     }
+    /// Playback read state behind `hasFreshMusicVolumeReadback`, for logs. Holds no addresses or names.
+    var musicVolumeDiagnosticDescription: String {
+        func hex(_ query: [UInt8]) -> String { query.map { String(format: "%02X", $0) }.joined() }
+        let reads = playbackReads.map { "\(hex($0.key))(timedOut=\($0.value.timedOut) refresh=\($0.value.refreshRequested) obsolete=\($0.value.isObsolete))" }
+        return "generation=\(playback.generation.rawValue) available=\(playback.available.map(String.init) ?? "unknown")"
+            + " state=\(playback.state.map { String($0.rawValue) } ?? "unknown") volume=\(playback.volume.map(String.init) ?? "unknown")"
+            + " range=\(playback.musicVolumeRange.map { "\($0.lowerBound)...\($0.upperBound)" } ?? "unknown")"
+            + " context=\(playbackControlContextIsAvailable) current=\(hasCurrentMusicVolumeControl) canWrite=\(canControlMusicVolume)"
+            + " readback=\(musicVolumeReadbackID != nil) fresh=[\(playbackFreshQueries.map(hex).sorted().joined(separator: ","))]"
+            + " reads=[\(reads.sorted().joined(separator: ","))] queued=[\(queuedPlaybackQueries.map(hex).sorted().joined(separator: ","))]"
+            + " pendingVolume=\(pendingChanges[.playbackVolume] != nil) expiredRead=\(hasExpiredControlRead) session=\(controlSession)"
+    }
     func hasCurrentMusicSourceContext(for localAddress: @autoclosure () -> String?) -> Bool {
         guard hasCurrentTable2Capabilities else { return false }
         guard multipoint.supportsInventory else { return true }
@@ -6002,6 +6014,10 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private func receivePlayback(_ payload: [UInt8]) -> Bool {
         var updatedPlayback = playback
         guard updatedPlayback.update(payload) else { return false }
+        if playback.generation == .v1 {
+            let bytes = payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            Self.logger.info("MDR v1 playback RX; payload=\(bytes, privacy: .public) read=\(self.playbackReads[self.playback.queryPayload(for: payload) ?? []] != nil) session=\(self.controlSession)")
+        }
         let isResponse = payload[0] == 0xA1 || payload[0] == 0xA3 || payload[0] == 0xA7
         let query = playback.queryPayload(for: payload)!
         var read: PlaybackRead?

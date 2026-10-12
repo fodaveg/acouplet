@@ -401,7 +401,10 @@ final class LDACController: ObservableObject {
                 let deadline = Date().addingTimeInterval(15)
                 while !self.hasMusicVolumeForHandoff || !headphones.hasFreshMusicVolumeReadback || headphones.musicVolumeReadbackID == previousReadback {
                     try Task.checkCancellation()
-                    guard Date() < deadline else { throw ControlError(String(localized: "The headphone volume could not be read. Connect the headphone controls in Acouplet and select this Mac as their audio source, then try LDAC again.")) }
+                    guard Date() < deadline else {
+                        Self.logger.notice("LDAC initial volume wait timed out; session=\(identifier.uuidString, privacy: .public) handoff=\(self.hasMusicVolumeForHandoff) fresh=\(headphones.hasFreshMusicVolumeReadback) newReadback=\(headphones.musicVolumeReadbackID != previousReadback) connected=\(headphones.isDeviceConnected) controller=\(devices.controller(for: address) === headphones) \(headphones.musicVolumeDiagnosticDescription, privacy: .public)")
+                        throw ControlError(String(localized: "The headphone volume could not be read. Connect the headphone controls in Acouplet and select this Mac as their audio source, then try LDAC again."))
+                    }
                     try await Task.sleep(for: .milliseconds(100))
                 }
                 try Task.checkCancellation()
