@@ -48,6 +48,7 @@ for scenario in ('three-devices', 'duplicate-address', 'invalid-address', 'inval
                 assert info['CFBundleIdentifier'] == 'dev.baglayan.Acouplet.preference-pane.' + suffix.lower()
                 assert info['NSPrincipalClass'] == 'SonyPreferencePane_' + suffix
                 assert info['CFBundleVersion'] == '7'
+                assert info['AcoupletAppTeam'] == 'ABCDE12345'
                 assert (bundle / 'Contents/MacOS' / info['CFBundleExecutable']).exists()
                 icon = 'Earbuds.tiff' if info['SonyDeviceSystemSymbol'] == 'earbuds.stemless' else 'Headphones.tiff'
                 assert info['NSPrefPaneIconFile'] == icon

@@ -9,6 +9,7 @@ final class SonyPreferencePaneClient: ObservableObject {
     @Published private(set) var connectionError: String?
     @Published private(set) var isUpdating = false
     let pinnedAddress: String?
+    private let appRequirement: String
     private var observation: Task<Void, Never>?
     private var command: Task<Void, Never>?
     private var generation = UUID()
@@ -19,8 +20,9 @@ final class SonyPreferencePaneClient: ObservableObject {
     private let path = FileManager.default.homeDirectoryForCurrentUser.path
         + "/Library/Containers/dev.baglayan.Acouplet/Data/tmp/" + SonyPreferencePaneWire.socketName
 
-    init(pinnedAddress: String? = nil) {
+    init(pinnedAddress: String? = nil, appTeam: String? = nil) {
         self.pinnedAddress = pinnedAddress
+        appRequirement = SonyPreferencePaneWire.appRequirement(team: appTeam)
         selectedAddress = pinnedAddress
     }
 
@@ -160,13 +162,14 @@ final class SonyPreferencePaneClient: ObservableObject {
 
     private func exchange(_ request: SonyPreferencePaneRequest, generation: UUID) async {
         let path = path
+        let appRequirement = appRequirement
         requestSequence += 1
         let sequence = requestSequence
         do {
             let reply = try await Task.detached {
                 let fd = try SonyPreferencePaneWire.connect(path: path)
                 defer { close(fd) }
-                try SonyPreferencePaneWire.authenticate(fd, requirement: SonyPreferencePaneWire.appRequirement)
+                try SonyPreferencePaneWire.authenticate(fd, requirement: appRequirement)
                 try SonyPreferencePaneWire.send(request, to: fd)
                 let reply = try SonyPreferencePaneWire.receive(SonyPreferencePaneReply.self, from: fd)
                 guard reply.version == SonyPreferencePaneWire.version, reply.id == request.id else {

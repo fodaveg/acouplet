@@ -4,6 +4,17 @@ import XCTest
 @MainActor
 @available(macOS 27.0, *)
 final class SonyPreferencePaneTests: XCTestCase {
+    func testAppRequirementUsesThePaneTeamAndKeepsTheOriginalTeamOtherwise() {
+        let original = "anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"5743Y47SC7\""
+        XCTAssertEqual(SonyPreferencePaneWire.appRequirement(team: nil), original)
+        XCTAssertEqual(SonyPreferencePaneWire.appRequirement(team: "5743Y47SC7"), original)
+        XCTAssertEqual(SonyPreferencePaneWire.appRequirement(team: "5LHT3P9C4T"),
+                       "anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"5LHT3P9C4T\"")
+        for invalid in ["", "5lht3p9c4t", "5LHT3P9C4", "5LHT3P9C4T\" or anchor apple", "5LHT3P9C4T\n"] {
+            XCTAssertEqual(SonyPreferencePaneWire.appRequirement(team: invalid), original, invalid)
+        }
+    }
+
     func testCommandsRejectStaleSessionServerAndDuplicateWithoutWriting() async throws {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         controller.simulateDeviceConnection(named: "WF-1000XM5")
