@@ -360,6 +360,17 @@ final class SonyMultipointTests: XCTestCase {
         XCTAssertNil(multipoint.peripheralActionPayload(.connect, address: secondAddress))
     }
 
+    func testLegacyListAcceptsSeveralConnectedDevicesWithTheSameStateByte() {
+        var multipoint = SonyMultipoint(legacySupportedFunctions: [0x38])
+        XCTAssertTrue(multipoint.update(legacyListPacket([
+            (firstAddress, 1, "Test Laptop"), (secondAddress, 1, "Test Phone"), ("02:00:00:00:00:A3", 0, "Test Tablet"),
+        ])))
+        XCTAssertFalse(multipoint.inventoryIsStale)
+        XCTAssertEqual(multipoint.devices.map(\.isConnected), [true, true, false])
+        XCTAssertEqual(Set(multipoint.devices.filter(\.isConnected).map(\.connectionID)).count, 2)
+        XCTAssertNil(multipoint.selectedSource)
+    }
+
     func testLegacyListRejectsMalformedPacketsAndMarksTheListStale() {
         var multipoint = SonyMultipoint(legacySupportedFunctions: [0x38])
         XCTAssertTrue(multipoint.update(legacyListPacket([(firstAddress, 1, "Test Laptop")])))
