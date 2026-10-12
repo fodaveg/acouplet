@@ -1184,7 +1184,8 @@ final class SonyPlaybackTests: XCTestCase {
     @MainActor
     private func makeNoNoiseController(generation: SonyProtocolInfo.Generation, functions: [UInt8]) -> SonyHeadphonesController {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
-        controller.simulateDeviceConnection(named: "WH-1000XM4")
+        // WH-1000XM3 keeps every advertised v1 function; the WH-1000XM4 hides the unverified ones.
+        controller.simulateDeviceConnection(named: "WH-1000XM3")
         let protocolPayload: [UInt8] = generation == .v1 ? [0x01, 0, 2, 0x10] : [0x01, 0, 3, 0, 0x30, 0x18, 0, 1]
         controller.simulateProtocolMessage(protocolPayload, beginConnection: true)
         acknowledgeSimulatedCommands(controller)

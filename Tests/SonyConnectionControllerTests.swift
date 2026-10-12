@@ -665,6 +665,42 @@ final class SonyConnectionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testSonyServiceLookupPrefersCurrentServiceAndFallsBackToLegacySerialService() throws {
+        let current = Data(SonyHeadphonesController.sonyServiceUUIDs[0])
+        let legacy = Data(SonyHeadphonesController.sonyServiceUUIDs[1])
+        XCTAssertEqual(current.prefix(4), Data([0x95, 0x6C, 0x7B, 0x26]))
+        XCTAssertEqual(legacy, Data([0x96, 0xCC, 0x20, 0x3E, 0x50, 0x68, 0x46, 0xAD,
+                                     0xB3, 0x2D, 0xE3, 0x16, 0xF5, 0xE0, 0x69, 0xBA]))
+
+        let both = ServiceDiscoveryDevice()
+        both.service = ServiceDiscoveryRecord()
+        XCTAssertEqual(try XCTUnwrap(SonyHeadphonesController.sonyServiceRecord(on: both)).uuid, Array(current))
+        XCTAssertEqual(both.lookedUpUUIDs, [current])
+
+        let legacyOnly = ServiceDiscoveryDevice()
+        legacyOnly.service = ServiceDiscoveryRecord()
+        legacyOnly.serviceUUID = legacy
+        XCTAssertEqual(try XCTUnwrap(SonyHeadphonesController.sonyServiceRecord(on: legacyOnly)).uuid, Array(legacy))
+        XCTAssertEqual(legacyOnly.lookedUpUUIDs, [current, legacy])
+
+        let neither = ServiceDiscoveryDevice()
+        XCTAssertNil(SonyHeadphonesController.sonyServiceRecord(on: neither))
+        XCTAssertEqual(neither.lookedUpUUIDs, [current, legacy])
+    }
+
+    @MainActor
+    func testLegacySerialServiceOpensWithoutAnotherDiscovery() {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        let device = ServiceDiscoveryDevice()
+        device.service = ServiceDiscoveryRecord()
+        device.serviceUUID = Data(SonyHeadphonesController.sonyServiceUUIDs[1])
+        controller.simulateSonyLink(to: device)
+        XCTAssertTrue(device.discoveryCallbacks.isEmpty)
+        XCTAssertEqual(device.openedChannels, [7])
+    }
+
+    @MainActor
     func testMissingSonyServiceIsDiscoveredBeforeOpeningWithoutDuplicateQueries() async {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         defer { controller.simulateControlLoss() }
@@ -680,7 +716,7 @@ final class SonyConnectionControllerTests: XCTestCase {
         device.complete()
         for _ in 0..<4 { await Task.yield() }
         XCTAssertEqual(device.openedChannels, [7])
-        XCTAssertEqual(device.serviceLookups, 2)
+        XCTAssertEqual(device.serviceLookups, 3)
         device.complete()
         for _ in 0..<4 { await Task.yield() }
         XCTAssertEqual(device.openedChannels, [7])
@@ -2460,6 +2496,9 @@ private final class ServiceDiscoveryDevice: NSObject, SonyBluetoothDevice, @unch
     var discoveryCallbacks: [any SonyServiceDiscoveryDelegate] = []
     var openedChannels: [BluetoothRFCOMMChannelID] = []
     var serviceLookups = 0
+    var lookedUpUUIDs: [Data] = []
+    /// When set, only this service UUID resolves, to model devices that publish just one Sony service.
+    var serviceUUID: Data?
     var onOpen: (() -> Void)?
 
     func isClassicConnected() -> Bool { connected }
@@ -2474,6 +2513,9 @@ private final class ServiceDiscoveryDevice: NSObject, SonyBluetoothDevice, @unch
 
     func sonyServiceRecord(for uuid: IOBluetoothSDPUUID) -> (any SonyServiceRecord)? {
         serviceLookups += 1
+        let bytes = Data(bytes: uuid.bytes, count: Int(uuid.length))
+        lookedUpUUIDs.append(bytes)
+        if let serviceUUID, serviceUUID != bytes { return nil }
         return service
     }
 

@@ -284,10 +284,21 @@ struct SonyLegacyControls: Equatable, Sendable {
         automaticPowerOff?.invalidateRead(query)
     }
 
-    init?(supportPayload: [UInt8]) {
+    /// MDR v1 functions a model reports but whose changes have not been confirmed on that
+    /// model's hardware. They are left out of `supportedFunctions` so the controls stay hidden.
+    static func unverifiedFunctions(for model: SonyDeviceModel) -> Set<UInt8> {
+        switch model {
+        // WH-1000XM4, firmware 3.0.1: the Custom button change was acknowledged but not applied,
+        // and NC Optimizer and the sound quality connection mode were not exercised.
+        case .whXM4: [0x81, 0xE1, 0xF6]
+        default: []
+        }
+    }
+
+    init?(supportPayload: [UInt8], model: SonyDeviceModel = .unknown) {
         guard supportPayload.count >= 3, supportPayload.prefix(2) == [0x07, 0x00],
               supportPayload.count == 3 + Int(supportPayload[2]) else { return nil }
-        supportedFunctions = Set(supportPayload.dropFirst(3))
+        supportedFunctions = Set(supportPayload.dropFirst(3)).subtracting(Self.unverifiedFunctions(for: model))
         dsee = SonyLegacyDSEE(isSupported: supportedFunctions.contains(0xE2))
         connectionQuality = SonyLegacyConnectionQuality(isSupported: supportedFunctions.contains(0xE1))
         wearingControl = SonyLegacyWearingControl(isSupported: supportedFunctions.contains(0xF3))

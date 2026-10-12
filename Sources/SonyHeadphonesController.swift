@@ -691,10 +691,24 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private enum Stage { case idle, protocolInfo, supportFunctions, bleIdentity, noiseControl, ready, unsupported }
-    private static let sonyUUIDBytes: [UInt8] = [
-        0x95, 0x6C, 0x7B, 0x26, 0xD4, 0x9A, 0x4B, 0xA8,
-        0xB0, 0x3F, 0xB1, 0x7D, 0x39, 0x3C, 0xB6, 0xE2,
+    /// RFCOMM services that carry Sony's control protocol, in lookup order. Current models
+    /// publish the first one; older MDR v1 headphones such as the WH-1000XM4 only publish
+    /// the second ("Serial HPC"), so it is tried only when the first is absent.
+    static let sonyServiceUUIDs: [[UInt8]] = [
+        [0x95, 0x6C, 0x7B, 0x26, 0xD4, 0x9A, 0x4B, 0xA8,
+         0xB0, 0x3F, 0xB1, 0x7D, 0x39, 0x3C, 0xB6, 0xE2],
+        [0x96, 0xCC, 0x20, 0x3E, 0x50, 0x68, 0x46, 0xAD,
+         0xB3, 0x2D, 0xE3, 0x16, 0xF5, 0xE0, 0x69, 0xBA],
     ]
+
+    /// Returns the first Sony control service the device publishes, following `sonyServiceUUIDs`.
+    static func sonyServiceRecord(on device: any SonyBluetoothDevice) -> (record: any SonyServiceRecord, uuid: [UInt8])? {
+        for bytes in sonyServiceUUIDs {
+            let uuid = bytes.withUnsafeBytes { IOBluetoothSDPUUID(bytes: $0.baseAddress!, length: bytes.count) }
+            if let record = device.sonyServiceRecord(for: uuid) { return (record, bytes) }
+        }
+        return nil
+    }
     private static let asmByFunction: [(function: UInt8, type: UInt8)] = [
         (0x6D, 0x19), (0x6B, 0x17), (0x68, 0x15), (0x67, 0x22), (0x66, 0x21),
     ]
@@ -4502,10 +4516,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             return
         }
         pendingClassicOpenID = nil
-        let uuid = Self.sonyUUIDBytes.withUnsafeBytes {
-            IOBluetoothSDPUUID(bytes: $0.baseAddress!, length: Self.sonyUUIDBytes.count)
-        }
-        guard let record = device.sonyServiceRecord(for: uuid) else {
+        guard let (record, uuid) = Self.sonyServiceRecord(on: device) else {
             if discoverServices {
                 discoverSonyService(on: device, automatically: automatically)
             } else {
@@ -4526,7 +4537,8 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             return
         }
         controlChannelID = Int(channelID)
-        Self.logger.info("Opening RFCOMM channel \(channelID)")
+        let service = uuid.prefix(4).map { String(format: "%02X", $0) }.joined()
+        Self.logger.info("Opening RFCOMM channel \(channelID) for Sony service \(service, privacy: .public)")
     }
 
     private func discoverSonyService(on target: any SonyBluetoothDevice, automatically: Bool) {
@@ -6252,7 +6264,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         switch (payload[0], stage) {
         case (0x01, .protocolInfo):
-            guard let info = SonyProtocolInfo(payload: payload) else { return }
+            let reply = payload.map { String(format: "%02X", $0) }.joined(separator: " ")
+            guard let info = SonyProtocolInfo(payload: payload) else {
+                Self.logger.error("Unrecognized protocol info reply=\(reply, privacy: .public)")
+                return
+            }
+            Self.logger.info("Protocol info; generation=\(info.generation.rawValue, privacy: .public) version=\(String(format: "0x%X", info.version), privacy: .public) reply=\(reply, privacy: .public)")
             protocolInformation = info
             protocolVersion = info.version
             guard info.supportsTable1, info.generation != .v1 || !usesBluetoothLE else {
@@ -6682,8 +6699,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         guard type == 0x0C, payload.count >= 2 else { return }
         if payload[0] == 0x07 {
             guard stage == .supportFunctions, legacyReads.contains([0x06, 0]),
-                  let controls = SonyLegacyControls(supportPayload: payload) else { return }
+                  let controls = SonyLegacyControls(supportPayload: payload, model: deviceModel) else { return }
             legacyReads.remove([0x06, 0])
+            let hex = { (functions: Set<UInt8>) in functions.sorted().map { String(format: "%02X", $0) }.joined(separator: " ") }
+            let reported = hex(Set(payload.dropFirst(3)))
+            let hidden = hex(Set(payload.dropFirst(3)).subtracting(controls.supportedFunctions))
+            Self.logger.info("MDR v1 support functions=\(reported, privacy: .public) hidden=\(hidden, privacy: .public) model=\(self.deviceModel.rawValue, privacy: .public)")
             legacyControls = controls
             legacyOptimizer = SonyLegacyOptimizer(supportedFunctions: controls.supportedFunctions)
             legacySurround = SonyLegacySoundEffect(kind: .surround, supportedFunctions: controls.supportedFunctions)

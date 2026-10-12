@@ -479,6 +479,100 @@ final class SonyLegacyControllerTests: XCTestCase {
         XCTAssertTrue(controller.simulatedTransmittedFrames.filter { $0.type == 0x01 }.allSatisfy { $0.payload.isEmpty })
     }
 
+    // Replies captured from a WH-1000XM4 on firmware 3.0.1 over the "Serial HPC" RFCOMM service.
+    // The function list holds the 23 reported functions in sorted order.
+    private let whXM4Functions: [UInt8] = [0x07, 0, 0x17, 0x11, 0x12, 0x13, 0x14, 0x21, 0x22, 0x30, 0x38, 0x39, 0x51, 0x62,
+                                           0x71, 0x81, 0xA1, 0xC1, 0xD1, 0xD2, 0xE1, 0xE2, 0xF3, 0xF4, 0xF5, 0xF6]
+
+    func testWHXM4CapturedRepliesDecodeAndUnverifiedFunctionsStayHidden() throws {
+        XCTAssertEqual(SonyProtocolInfo(payload: [0x01, 0, 0x70, 0])?.generation, .v1)
+        XCTAssertEqual(SonyProtocolInfo(payload: [0x01, 0, 0x70, 0])?.version, 0x7000)
+        XCTAssertEqual(SonyLegacyControls.unverifiedFunctions(for: .whXM4), [0x81, 0xE1, 0xF6])
+        XCTAssertTrue(SonyLegacyControls.unverifiedFunctions(for: .whXM3).isEmpty)
+        XCTAssertEqual(try XCTUnwrap(SonyLegacyControls(supportPayload: whXM4Functions)).supportedFunctions.count, 23)
+
+        var controls = try XCTUnwrap(SonyLegacyControls(supportPayload: whXM4Functions, model: .whXM4))
+        XCTAssertEqual(controls.supportedFunctions.count, 20)
+        XCTAssertTrue(controls.supportedFunctions.isDisjoint(with: [0x81, 0xE1, 0xF6]))
+        XCTAssertFalse(controls.connectionQuality.isSupported)
+        XCTAssertFalse(SonyLegacyOptimizer(supportedFunctions: controls.supportedFunctions).isSupported)
+        XCTAssertNil(SonyTouchAssignments(supportedFunctions: controls.supportedFunctions, generation: .v1).inquiryType)
+        XCTAssertTrue(controls.dsee.isSupported)
+        XCTAssertTrue(controls.wearingControl.isSupported)
+        XCTAssertNotNil(controls.automaticPowerOff)
+        XCTAssertEqual(controls.batteryQueries, [[0x10, 0]])
+
+        XCTAssertTrue(controls.update([0x61, 2, 2, 0, 1, 2, 0, 0x14, 1, 0x14]))
+        XCTAssertEqual(controls.noiseCapability?.modes, [.off, .anc, .ambient, .wind])
+        XCTAssertEqual(controls.noiseCapability?.ambientRange(focusOnVoice: false), 1...20)
+        XCTAssertEqual(controls.noiseCapability?.ambientRange(focusOnVoice: true), 1...20)
+        XCTAssertTrue(controls.update([0x63, 2, 0]))
+        XCTAssertTrue(controls.update([0x11, 0, 0x50, 0]))
+        XCTAssertEqual(controls.batteries.single?.level, 80)
+        XCTAssertEqual(controls.batteries.single?.chargingState, .notCharging)
+        XCTAssertTrue(controls.update([0x67, 2, 1, 2, 2, 1, 0, 0]))
+        XCTAssertEqual(controls.noiseState?.mode, .anc)
+        XCTAssertTrue(controls.canSetNoiseControl)
+        XCTAssertEqual(controls.noiseControlPayload(mode: .ambient, ambientLevel: 15, focusOnVoice: true), [0x68, 2, 1, 2, 0, 1, 1, 0x0F])
+        XCTAssertEqual(controls.noiseControlPayload(mode: .wind, ambientLevel: 10, focusOnVoice: false), [0x68, 2, 1, 2, 1, 1, 0, 0])
+        XCTAssertEqual(controls.noiseControlPayload(mode: .anc, ambientLevel: 10, focusOnVoice: false), [0x68, 2, 1, 2, 2, 1, 0, 0])
+        for (reply, mode, focus) in [([UInt8]([0x69, 2, 1, 2, 0, 1, 1, 0x0F]), NoiseControlMode.ambient, true),
+                                     ([0x69, 2, 1, 2, 1, 1, 0, 0], .wind, false),
+                                     ([0x69, 2, 0, 2, 1, 1, 0, 0], .off, false)] {
+            XCTAssertTrue(controls.update(reply))
+            XCTAssertEqual(controls.noiseState?.mode, mode)
+            XCTAssertEqual(controls.noiseState?.focusOnVoice, focus)
+        }
+        XCTAssertEqual(controls.noiseControlPayload(mode: .off, ambientLevel: 10, focusOnVoice: false), [0x68, 2, 0, 2, 1, 1, 0, 0])
+
+        XCTAssertTrue(controls.update([0xE1, 2, 2, 0]))
+        XCTAssertTrue(controls.update([0xE3, 2, 0]))
+        XCTAssertTrue(controls.update([0xE7, 2, 0, 1]))
+        XCTAssertEqual(controls.dsee.mode, .automatic)
+        XCTAssertEqual(controls.dsee.setPayload(.off), [0xE8, 2, 0, 0])
+    }
+
+    func testWHXM4HandshakeReadsBatteryAndNoiseAndWritesNoiseWithoutHiddenControls() throws {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        controller.simulateDeviceConnection(named: "WH-1000XM4", controlBusy: true)
+        controller.simulateProtocolMessage([0x01, 0, 0x70, 0], beginConnection: true)
+        acknowledgeAll(controller)
+        let name = Array("WH-1000XM4".utf8)
+        deliver([0x05, 1, UInt8(name.count)] + name, to: controller)
+        deliver([0x05, 3, 0x30, 0x01], to: controller)
+        deliver(whXM4Functions, to: controller)
+        acknowledgeAll(controller)
+        deliver([0x61, 2, 2, 0, 1, 2, 0, 0x14, 1, 0x14], to: controller)
+        deliver([0x63, 2, 0], to: controller)
+        deliver([0x11, 0, 0x50, 0], to: controller)
+        acknowledgeAll(controller)
+        deliver([0x67, 2, 1, 2, 2, 1, 0, 0], to: controller)
+        acknowledgeAll(controller)
+
+        XCTAssertTrue(controller.isReady)
+        XCTAssertEqual(controller.deviceModel, .whXM4)
+        XCTAssertEqual(controller.controlProtocol, "MDR v1")
+        XCTAssertEqual(controller.batteries.single?.level, 80)
+        XCTAssertEqual(controller.noiseControlMode, .anc)
+        XCTAssertEqual(controller.availableNoiseModes, [.off, .anc, .ambient, .wind])
+        XCTAssertTrue(controller.supportsVoiceFocus)
+        XCTAssertFalse(controller.supportsConnectionMode)
+        XCTAssertFalse(controller.legacyOptimizer.isSupported)
+        XCTAssertTrue(controller.touchAssignments.queryPayloads.isEmpty)
+
+        let sentBefore = controller.simulatedTransmittedFrames.count
+        controller.setNoiseControl(.ambient)
+        acknowledgeAll(controller)
+        XCTAssertTrue(controller.simulatedTransmittedFrames.dropFirst(sentBefore).contains {
+            $0.type == 0x0C && $0.payload == [0x68, 2, 1, 2, 0, 1, 0, 0x0A]
+        })
+        deliver([0x69, 2, 1, 2, 0, 1, 0, 0x0A], to: controller)
+        acknowledgeAll(controller)
+        XCTAssertEqual(controller.noiseControlMode, .ambient)
+        XCTAssertEqual(controller.ambientLevel, 10)
+    }
+
     func testCapabilityAndAvailabilityMustPrecedeOwnedCurrentStateInEitherOrder() {
         for statusFirst in [false, true] {
             let controller = beginController()
