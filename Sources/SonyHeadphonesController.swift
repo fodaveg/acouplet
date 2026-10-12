@@ -3051,7 +3051,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         if multipointTransition?.isFinished == false, frame.payload.count >= 2,
            [0xD8, 0xD6].contains(frame.payload[0]), frame.payload[1] == systemFeatures.multipointSlot {
             let setting = frame.payload[0] == 0xD8
-            let enabled = setting ? frame.payload.last == 0 : multipointTransition?.targetEnabled == true
+            let enabled = setting ? frame.payload.last == (systemFeatures.generation == .v1 ? 1 : 0) : multipointTransition?.targetEnabled == true
             Self.logger.notice("Multipoint TX; session=\(self.controlSession) setter=\(setting) slot=\(frame.payload[1]) target_enabled=\(enabled) phase=\(self.multipointTransition?.diagnosticPhase ?? "none", privacy: .public)")
         }
         if frame.payload.count == 2, frame.payload[0] == 0xD6,
@@ -5825,7 +5825,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                     let setter = sent.payload[0] == 0xD8
                     let owned = multipointTransition?.commandAcknowledged(sent.payload, session: session) == true
                     if owned, multipointTransition?.phase == .awaitingResponse { updateMultipointTimeout() }
-                    let enabled = setter ? sent.payload.last == 0 : multipointTransition?.targetEnabled == true
+                    let enabled = setter ? sent.payload.last == (systemFeatures.generation == .v1 ? 1 : 0) : multipointTransition?.targetEnabled == true
                     Self.logger.notice("Multipoint ACK; session=\(self.controlSession) setter=\(setter) slot=\(sent.payload[1]) target_enabled=\(enabled) setter_owned=\(owned) phase=\(self.multipointTransition?.diagnosticPhase ?? "none", privacy: .public)")
                 }
                 if sent.type == 0x0C, sent.payload.first == 0x98,

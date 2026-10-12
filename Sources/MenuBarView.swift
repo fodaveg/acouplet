@@ -175,8 +175,7 @@ struct MenuBarView: View {
                 }
             }
             .disabled(controlsDisabled)
-            if showsHeadphoneControls, headphones.multipoint.supportsSourceControl,
-               headphones.multipoint.devices.filter(\.isConnected).count > 1 {
+            if showsHeadphoneControls, MultipointSettingControl.showsMenuEntry(for: headphones) {
                 multipointControl
             }
             if showsHeadphoneControls {

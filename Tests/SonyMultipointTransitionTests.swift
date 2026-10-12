@@ -575,7 +575,11 @@ final class SonyMultipointTransitionTests: XCTestCase {
 
         let off = try XCTUnwrap(SonyMultipointTransition(enabled: false, model: { var on = state; on.update([0xD7, 0xD2, 0x01, 0x01]); return on }(), session: 3))
         XCTAssertEqual(off.requestPayload, [0xD8, 0xD2, 0x01, 0x00])
-        XCTAssertFalse(SonyConnectionAlert(payload: [0x99, 0x01, 0x07, 0x01], generation: .v1)!.isMultipointChange)
+        let turnOff = try XCTUnwrap(SonyConnectionAlert(payload: [0x99, 0x01, 0x07, 0x01], generation: .v1))
+        XCTAssertTrue(turnOff.isMultipointChange)
+        XCTAssertEqual(turnOff.availableActions, [.negative, .positive])
+        XCTAssertEqual(turnOff.replyPayload(.positive), [0x98, 0x01, 0x07, 0x01])
+        XCTAssertFalse(SonyConnectionAlert(payload: [0x99, 0x01, 0x08, 0x01], generation: .v1)!.isMultipointChange)
     }
 
     private func model(enabled: Bool? = false, slot: UInt8 = 0xD2, available: Bool? = true) -> SonySystemFeatures {

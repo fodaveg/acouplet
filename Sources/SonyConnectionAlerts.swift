@@ -96,8 +96,8 @@ struct SonyConnectionAlert: Equatable, Sendable {
 
     var isMultipointChange: Bool {
         switch (format, messageID) {
-        // MDR v1 0x06: sent by a WH-1000XM4 when multipoint is turned on; LDAC is then unavailable.
-        case (.fixed, 0x06), (.fixed, 0x07), (.fixed, 0x70), (.flexible, 0x01), (.legacyFixed, 0x06): true
+        // MDR v1, sent by a WH-1000XM4: 0x06 when multipoint is turned on (LDAC is then unavailable), 0x07 when it is turned off.
+        case (.fixed, 0x06), (.fixed, 0x07), (.fixed, 0x70), (.flexible, 0x01), (.legacyFixed, 0x06), (.legacyFixed, 0x07): true
         default: false
         }
     }

@@ -1943,6 +1943,8 @@ final class SonyLegacyMultipointTests: XCTestCase {
         XCTAssertEqual(headphones.systemFeatures.multipointSlot, 0xD2)
         XCTAssertEqual(headphones.systemFeatures.multipoint?.enabled, false)
         XCTAssertNotNil(MultipointSettingControl.enabled(for: headphones))
+        XCTAssertTrue(MultipointSettingControl.showsMenuEntry(for: headphones))
+        XCTAssertFalse(MultipointSettingControl.showsMenuEntry(for: SonyHeadphonesController(startAutomatically: false, simulated: true)))
         XCTAssertNil(headphones.multipointUnavailableReason)
         XCTAssertFalse(headphones.ldacRequiresMultipointOff)
         let sent = headphones.simulatedTransmittedFrames.map(\.payload)
@@ -2000,6 +2002,15 @@ final class SonyLegacyMultipointTests: XCTestCase {
         XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0xD8, 0xD2, 0x01, 0x00])
         ldac.setEnabled(true, forAddress: address)
         XCTAssertNil(ldac.multipointConflictAddress)
+
+        // Turning multipoint off makes a WH-1000XM4 ask with MDR v1 alert 0x07; the flow answers it for the user.
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0x99, 0x01, 0x07, 0x01])
+        for _ in 0..<40 where headphones.simulatedPendingFrame?.payload != [0x98, 0x01, 0x07, 0x01] {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0x98, 0x01, 0x07, 0x01])
+        XCTAssertNil(headphones.multipointTransition?.alert)
 
         headphones.simulateMultipointTimeout()
         XCTAssertEqual(headphones.multipointTransition?.phase, .failed)

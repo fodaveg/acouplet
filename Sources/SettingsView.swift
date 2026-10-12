@@ -2263,6 +2263,15 @@ struct MultipointSettingControl: View {
         }
     }
 
+    /// Whether the menu shows the multipoint entry. MDR v1 headphones such as the WH-1000XM4 list no
+    /// audio sources, so their entry appears whenever the multipoint setting itself is known.
+    static func showsMenuEntry(for headphones: SonyHeadphonesController) -> Bool {
+        if headphones.multipoint.supportsSourceControl {
+            return headphones.multipoint.devices.filter(\.isConnected).count > 1
+        }
+        return headphones.systemFeatures.generation == .v1 && enabled(for: headphones) != nil
+    }
+
     static func enabled(for headphones: SonyHeadphonesController) -> Bool? {
         headphones.systemFeatures.multipoint?.enabled
             ?? headphones.multipointTransition.flatMap { $0.isFinished ? nil : $0.originalEnabled }
