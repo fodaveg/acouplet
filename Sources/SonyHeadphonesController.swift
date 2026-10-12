@@ -2223,7 +2223,26 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
     }
 
+    private var probeSession: UInt64?
+
+    private func probeV1Reads() {
+        guard protocolInformation?.generation == .v1, probeSession != controlSession,
+              isSimulated || channel != nil || bleTransport?.isReady == true else { return }
+        probeSession = controlSession
+        let reads: [(UInt8, [UInt8])] = [
+            (0x0C, [0xF0, 0x06]), (0x0C, [0xF2, 0x06]), (0x0C, [0xF6, 0x06]),
+            (0x0C, [0x80, 0x01]), (0x0C, [0x82, 0x01]), (0x0C, [0x86, 0x01]),
+            (0x0C, [0xE0, 0x01]), (0x0C, [0xE2, 0x01]), (0x0C, [0xE6, 0x01]),
+            (0x0E, [0x30, 0x01]), (0x0E, [0x32, 0x01]), (0x0E, [0x36, 0x01]),
+        ]
+        for (type, payload) in reads {
+            Self.logger.notice("PROBE tx type=0x\(String(format: "%02X", type), privacy: .public) payload=\(payload.map { String(format: "%02X", $0) }.joined(separator: " "), privacy: .public)")
+            if let frame = commandQueue.enqueue(payload: payload, type: type) { transmit(frame) }
+        }
+    }
+
     private func requestAudioFeatures() {
+        defer { probeV1Reads() }
         if let legacyControls {
             for payload in legacyControls.dsee.queryPayloads + legacyControls.connectionQuality.queryPayloads + legacyControls.wearingControl.queryPayloads
                 + (legacyControls.automaticPowerOff?.queryPayloads ?? []) + touchAssignments.queryPayloads + systemFeatures.queryPayloads { send(payload) }
@@ -6127,6 +6146,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private func dispatch(_ payload: [UInt8], type: UInt8) {
+        Self.logger.notice("PROBE rx type=0x\(String(format: "%02X", type), privacy: .public) payload=\(payload.map { String(format: "%02X", $0) }.joined(separator: " "), privacy: .public)")
         if stage == .unsupported { return }
         if receiveFirmwareUpdateIdentity(payload, type: type) { return }
         if type == 0x0C, payload[0] == 0x05, payload.count >= 2, [0x01, 0x03].contains(payload[1]) {
