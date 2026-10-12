@@ -333,6 +333,61 @@ final class SonyMultipointTests: XCTestCase {
         }
     }
 
+    // MDR v1 `37 01` list: [address][state][name length][name] per entry plus a trailing 01, no class bytes.
+    // Addresses and names are invented; the byte layout follows a WH-1000XM4 capture (firmware 3.0.1).
+    private func legacyListPacket(_ entries: [(String, UInt8, String)]) -> [UInt8] {
+        var packet: [UInt8] = [0x37, 0x01, UInt8(entries.count)]
+        for (address, state, name) in entries {
+            packet += Array(address.utf8)
+            packet += [state, UInt8(name.utf8.count)]
+            packet += Array(name.utf8)
+        }
+        packet.append(0x01)
+        return packet
+    }
+
+    func testLegacyListParsesConnectedAndSavedDevicesWithoutASource() throws {
+        var multipoint = SonyMultipoint(legacySupportedFunctions: [0x38])
+        XCTAssertEqual(multipoint.queryPayloads, [[0x36, 0x01]])
+        XCTAssertTrue(multipoint.update(legacyListPacket([(firstAddress, 1, "Test Laptop"), (secondAddress, 0, "Test Phone Ü")])))
+        XCTAssertEqual(multipoint.devices.map(\.address), [firstAddress, secondAddress])
+        XCTAssertEqual(multipoint.devices.map(\.name), ["Test Laptop", "Test Phone Ü"])
+        XCTAssertEqual(multipoint.devices.map(\.isConnected), [true, false])
+        XCTAssertNil(multipoint.selectedSource)
+        XCTAssertFalse(multipoint.inventoryIsStale)
+        XCTAssertFalse(multipoint.canManageDevices)
+        XCTAssertFalse(multipoint.canControlSources)
+        XCTAssertNil(multipoint.peripheralActionPayload(.connect, address: secondAddress))
+    }
+
+    func testLegacyListRejectsMalformedPacketsAndMarksTheListStale() {
+        var multipoint = SonyMultipoint(legacySupportedFunctions: [0x38])
+        XCTAssertTrue(multipoint.update(legacyListPacket([(firstAddress, 1, "Test Laptop")])))
+        var truncated = legacyListPacket([(firstAddress, 1, "Test Laptop")])
+        truncated.removeLast(3)
+        XCTAssertFalse(multipoint.update(truncated))
+        XCTAssertTrue(multipoint.inventoryIsStale)
+        XCTAssertFalse(multipoint.update(legacyListPacket([(firstAddress, 1, "A"), (firstAddress, 0, "B")])))
+        XCTAssertTrue(multipoint.update(legacyListPacket([(secondAddress, 0, "Test Phone")])))
+        XCTAssertFalse(multipoint.inventoryIsStale)
+        XCTAssertEqual(multipoint.devices.map(\.name), ["Test Phone"])
+    }
+
+    func testLegacyListIsIgnoredWithoutFunction38AndV2KeepsItsOwnMeaning() {
+        var without = SonyMultipoint(legacySupportedFunctions: [0x30])
+        XCTAssertTrue(without.queryPayloads.isEmpty)
+        XCTAssertFalse(without.update(legacyListPacket([(firstAddress, 1, "Test Laptop")])))
+        XCTAssertTrue(without.devices.isEmpty)
+
+        var v2 = SonyMultipoint(supportedFunctions: [0x31, 0x32])
+        XCTAssertFalse(v2.supportsLegacyInventory)
+        XCTAssertEqual(v2.queryPayloads, [[0x30, 0x02], [0x32, 0x02], [0x36, 0x02], [0x36, 0x01]])
+        XCTAssertTrue(v2.update([0x37, 0x01, 0]))
+        XCTAssertEqual(v2.keeping, true)
+        XCTAssertFalse(v2.update(legacyListPacket([(firstAddress, 1, "Test Laptop")])))
+        XCTAssertTrue(v2.devices.isEmpty)
+    }
+
     private let firstAddress = "02:00:00:00:00:A1"
     private let secondAddress = "02:00:00:00:00:A2"
 

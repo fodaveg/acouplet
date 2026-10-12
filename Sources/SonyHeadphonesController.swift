@@ -2178,7 +2178,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 if payload == playback.capabilityQueryPayload, playback.hasReceivedCapabilities { continue }
                 send(payload)
             }
-            for payload in voiceGuidance.queryPayloads { send(payload, type: 0x0E) }
+            for payload in voiceGuidance.queryPayloads + multipoint.queryPayloads { send(payload, type: 0x0E) }
             return
         }
         guard protocolInformation?.generation != .v1 else { return }
@@ -4953,7 +4953,8 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                 && (voiceGuidance.queryPayloads.contains(payload)
                     || (payload.count == 4 && payload.prefix(3) == [0x48, 1, 1]
                         && voiceGuidance.setEnabledPayload(payload[3] == 1) == payload))
-            guard isVoiceGuidance || (type == 0x0C && (
+            let isLegacyDeviceList = type == 0x0E && payload == [0x36, 0x01] && multipoint.queryPayloads.contains(payload)
+            guard isVoiceGuidance || isLegacyDeviceList || (type == 0x0C && (
                   (legacyControls?.allows(payload) ?? [[0x04, 0x01], [0x04, 0x03], [0x06, 0x00]].contains(payload))
                     || isEqualizerQuery || equalizer.acceptsSetPayload(payload) || isTouchAssignment || isConnectionAlert
                     || isSoundEffectQuery || legacySurround.acceptsSetPayload(payload) || legacySoundPosition.acceptsSetPayload(payload)
@@ -5900,6 +5901,17 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         return payload[0] == 0x21 ? state.threshold != nil : state.enabled != nil && state.effectActive != nil
     }
 
+    /// Stores the read-only MDR v1 device list (`37 01`). Only the lists the headphones send after
+    /// announcing function 0x38 are accepted; nothing here writes to the headphones.
+    private func receiveLegacyDeviceList(_ payload: [UInt8]) -> Bool {
+        guard multipoint.supportsLegacyInventory, payload.prefix(2) == [0x37, 0x01] else { return false }
+        var received = multipoint
+        let updated = received.update(payload)
+        if multipoint != received { multipoint = received }
+        if updated { lastSyncDate = Date() }
+        return true
+    }
+
     private func receiveVoiceGuidance(_ payload: [UInt8]) {
         let isLegacy = voiceGuidance.generation == .v1
         guard payload.count >= 2, [0x41, 0x43, 0x45, 0x47].contains(payload[0])
@@ -6070,7 +6082,10 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         if type == 0x0C, receivePlayback(payload) { return }
         if protocolInformation?.generation == .v1 {
-            if type == 0x0E { receiveVoiceGuidance(payload) }
+            if type == 0x0E {
+                if receiveLegacyDeviceList(payload) { return }
+                receiveVoiceGuidance(payload)
+            }
             else { receiveLegacyControls(payload, type: type) }
             return
         }
@@ -6712,6 +6727,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             let hidden = hex(Set(payload.dropFirst(3)).subtracting(controls.supportedFunctions))
             Self.logger.info("MDR v1 support functions=\(reported, privacy: .public) hidden=\(hidden, privacy: .public) model=\(self.deviceModel.rawValue, privacy: .public)")
             legacyControls = controls
+            multipoint = SonyMultipoint(legacySupportedFunctions: controls.supportedFunctions)
             systemFeatures = SonySystemFeatures(legacyGeneralSettings: controls.supportedFunctions)
             legacyOptimizer = SonyLegacyOptimizer(supportedFunctions: controls.supportedFunctions)
             legacySurround = SonyLegacySoundEffect(kind: .surround, supportedFunctions: controls.supportedFunctions)

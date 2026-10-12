@@ -2021,7 +2021,51 @@ final class SonyLegacyMultipointTests: XCTestCase {
         XCTAssertEqual(ldac.targetAddress, address)
     }
 
-    private func preparedXM4(multipointEnabled: Bool) throws -> (SonyDeviceCoordinator, SonyHeadphonesController) {
+    func testWHXM4ListsDevicesReadOnlyWhenMultipointAnnouncesFunction38() throws {
+        let (_, headphones) = try preparedXM4(multipointEnabled: true, extraFunctions: [0x38])
+        defer { headphones.simulateControlLoss() }
+        XCTAssertTrue(headphones.multipoint.supportsLegacyInventory)
+        XCTAssertFalse(headphones.multipoint.supportsInventory)
+        XCTAssertEqual(headphones.simulatedTransmittedFrames.filter { $0.type == 0x0E && $0.payload == [0x36, 0x01] }.count, 1)
+        XCTAssertFalse(MultipointControls.isVisible(for: headphones.multipoint))
+
+        headphones.simulateProtocolMessage(legacyList, type: 0x0E)
+        acknowledgeAll(headphones)
+        XCTAssertEqual(headphones.multipoint.devices.map(\.name), ["Test Laptop", "Test Phone"])
+        XCTAssertEqual(headphones.multipoint.devices.map(\.isConnected), [true, false])
+        XCTAssertTrue(MultipointControls.isVisible(for: headphones.multipoint))
+        XCTAssertNil(headphones.multipoint.selectedSource)
+
+        let before = headphones.simulatedTransmittedFrames.count
+        XCTAssertTrue(headphones.canRefreshDevices)
+        headphones.refreshDevices()
+        acknowledgeAll(headphones)
+        XCTAssertEqual(headphones.simulatedTransmittedFrames.dropFirst(before).map { [$0.type] + $0.payload }, [[0x0E, 0x36, 0x01]])
+        XCTAssertNil(headphones.multipoint.peripheralActionPayload(.disconnect, address: "02:00:00:00:00:A1"))
+        XCTAssertNil(headphones.multipoint.sourceSwitchPayload(address: "02:00:00:00:00:A1"))
+    }
+
+    func testWHXM4WithoutFunction38NeverAsksForOrShowsADeviceList() throws {
+        let (_, headphones) = try preparedXM4(multipointEnabled: false)
+        defer { headphones.simulateControlLoss() }
+        XCTAssertFalse(headphones.multipoint.supportsLegacyInventory)
+        XCTAssertFalse(headphones.simulatedTransmittedFrames.contains { $0.type == 0x0E && $0.payload.first == 0x36 })
+        headphones.simulateProtocolMessage(legacyList, type: 0x0E)
+        XCTAssertTrue(headphones.multipoint.devices.isEmpty)
+        let before = headphones.simulatedTransmittedFrames.count
+        headphones.refreshDevices()
+        XCTAssertEqual(headphones.simulatedTransmittedFrames.count, before)
+        XCTAssertFalse(MultipointControls.isVisible(for: headphones.multipoint))
+    }
+
+    /// `37 01` as captured from a WH-1000XM4 (2 of 8 entries), with invented addresses and names.
+    private var legacyList: [UInt8] {
+        let laptop = Array("Test Laptop".utf8), phone = Array("Test Phone".utf8)
+        return [0x37, 0x01, 0x02] + Array("02:00:00:00:00:A1".utf8) + [1, UInt8(laptop.count)] + laptop
+            + Array("02:00:00:00:00:A2".utf8) + [0, UInt8(phone.count)] + phone + [1]
+    }
+
+    private func preparedXM4(multipointEnabled: Bool, extraFunctions: [UInt8] = []) throws -> (SonyDeviceCoordinator, SonyHeadphonesController) {
         let coordinator = SonyDeviceCoordinator(fallbackController: SonyHeadphonesController(startAutomatically: false, simulated: true)) { device in
             SonyHeadphonesController(startAutomatically: false, simulated: true, pinnedAddress: device.address, advertisedName: device.name)
         }
@@ -2033,7 +2077,7 @@ final class SonyLegacyMultipointTests: XCTestCase {
         let name = Array("WH-1000XM4".utf8)
         headphones.simulateProtocolMessage([0x05, 1, UInt8(name.count)] + name)
         headphones.simulateProtocolMessage([0x05, 3, 0x30, 0x01])
-        headphones.simulateProtocolMessage([0x07, 0, 3, 0x11, 0xA1, 0xD2])
+        headphones.simulateProtocolMessage([0x07, 0, UInt8(3 + extraFunctions.count), 0x11, 0xA1, 0xD2] + extraFunctions)
         acknowledgeAll(headphones)
         headphones.simulateProtocolMessage([0x05, 2, 5] + Array("3.0.1".utf8))
         XCTAssertTrue(headphones.isReady)
