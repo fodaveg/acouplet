@@ -265,9 +265,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }) {
             return .terminateLater
         }
-        // Restoring LDAC reconnects the ACL; from here on nothing may open a new RFCOMM channel,
-        // or the open races the process exit and leaves the headphones without a control channel.
-        environment.devices.beginTermination()
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         if environment.ldac.needsStopBeforeTermination {
             environment.ldac.stop(reason: "app is terminating") { [weak self] in
@@ -278,8 +275,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
         #endif
+        // LDAC restoration needs the control channel to reopen after its ACL reconnect (connection mode
+        // restore goes over MDR), so opens are only blocked once ldac.stop has finished. An open that
+        // the reconnect triggered is in flight by now and the drain below picks it up.
         // Never exit with an RFCOMM open or close in flight: bluetoothd ignores a close sent while the
         // open is pending. Bounded to 1.5 s per controller.
+        environment.devices.beginTermination()
         if environment.devices.drainRFCOMMForTermination(completion: { [weak self] in
             guard let self else { sender.reply(toApplicationShouldTerminate: true); return }
             let reply = self.applicationShouldTerminate(sender)
