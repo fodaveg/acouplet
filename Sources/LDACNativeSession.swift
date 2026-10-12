@@ -1,6 +1,7 @@
 #if !ACOUPLET_PUBLIC_APIS_ONLY
 import Darwin
 import Foundation
+import OSLog
 
 struct LDACFormat: Equatable, Codable, Sendable {
     let sampleRateHz: Int
@@ -96,6 +97,10 @@ struct LDACPriorityCleanupError: LocalizedError, Sendable {
 }
 
 final class LDACNativeSession: @unchecked Sendable {
+    private static let logger = Logger(subsystem: "dev.baglayan.Acouplet", category: "LDACLifecycle")
+    /// Signaling helper lines that describe the headphones' audio endpoints and the codec choice. They hold no addresses.
+    private static let endpointLinePrefixes = ["SEP ", "CAPABILITY ", "LDAC SEID=", "LDAC_UNAVAILABLE ", "LDAC_SELECTED "]
+
     private enum PriorityPhase {
         case unused, configuring, configured, stopping, uncertain, removing, removed
     }
@@ -435,6 +440,9 @@ final class LDACNativeSession: @unchecked Sendable {
     private func handle(_ source: String, line: String) throws {
         if source != "daemon" && !line.hasPrefix("SEND ") && !line.hasPrefix("DRAIN ") && !line.hasPrefix("RX ") {
             record("\(source) \(line)")
+        }
+        if source == "probe", Self.endpointLinePrefixes.contains(where: line.hasPrefix) {
+            Self.logger.notice("LDAC endpoint \(line, privacy: .public)")
         }
         if (source == "probe" || source == "media") &&
             (line.hasPrefix("OPEN_CANCELLATION_UNCONFIRMED ") || line.hasPrefix("OPEN_TERMINAL_UNCONFIRMED ") || line.hasPrefix("OPEN_CLOSE_UNCONFIRMED ")) {
