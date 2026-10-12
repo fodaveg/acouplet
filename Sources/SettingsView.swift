@@ -2282,7 +2282,7 @@ struct MultipointSettingControl: View {
         if presentedSoundQualityWarning {
             message += "\n\n" + String(localized: "Audio may cut out when Sound Quality and multipoint are both enabled.")
         }
-        if alert.format == .fixed, alert.messageID == 0x06 {
+        if alert.format == .fixed || alert.format == .legacyFixed, alert.messageID == 0x06 {
             message += String(localized: "\n\nThe headphones report that LDAC will be unavailable with this change.")
         }
         if alert.format == .flexible {

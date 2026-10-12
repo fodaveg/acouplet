@@ -231,6 +231,7 @@ struct MenuBarView: View {
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
     private var ldacState: LDACState { ldac.targetAddress == headphones.address ? ldac.state : .off }
+    private var isTurningOffMultipointForLDAC: Bool { ldac.multipointShutdownAddress == headphones.address }
 
     private var ldacIsEnabled: Bool {
         switch ldacState {
@@ -286,9 +287,10 @@ struct MenuBarView: View {
                 switch ldacState {
                 case .requested, .connecting, .stopping:
                     ProgressView().controlSize(.mini).accessibilityHidden(true)
-                default: EmptyView()
+                default:
+                    if isTurningOffMultipointForLDAC { ProgressView().controlSize(.mini).accessibilityHidden(true) }
                 }
-                Text(ldacStatusText)
+                Text(isTurningOffMultipointForLDAC ? String(localized: "Turning off multipoint…") : ldacStatusText)
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -300,9 +302,20 @@ struct MenuBarView: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .tint(.accentColor)
-                .disabled(!ldacIsEnabled && (!ldac.canEnable(forAddress: headphones.address) || !ldac.canStartOrInstallDriver))
+                .disabled(!ldacIsEnabled && (isTurningOffMultipointForLDAC || !ldac.canEnable(forAddress: headphones.address) || !ldac.canStartOrInstallDriver))
                 .accessibilityValue(ldacStatusText)
                 .accessibilityIdentifier("audio.ldac")
+                .alert("Turn off multipoint for LDAC?", isPresented: Binding(
+                    get: { ldac.multipointConflictAddress == headphones.address },
+                    set: { if !$0, ldac.multipointConflictAddress == headphones.address { ldac.resolveMultipointConflict(turnOffMultipoint: false) } }
+                )) {
+                    Button("Turn Off Multipoint") { ldac.resolveMultipointConflict(turnOffMultipoint: true) }
+                        .accessibilityIdentifier("audio.ldacTurnOffMultipoint")
+                    Button("Keep Multipoint", role: .cancel) { ldac.resolveMultipointConflict(turnOffMultipoint: false) }
+                        .accessibilityIdentifier("audio.ldacKeepMultipoint")
+                } message: {
+                    Text("These headphones offer LDAC only when multipoint is off. Turning it off restarts them and disconnects any other device.")
+                }
             }
             if !ldac.isSessionRunning, ldacState != .waitingForDevice { LDACDriverGuidance() }
             if case .failed(let error) = ldacState {

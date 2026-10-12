@@ -15,6 +15,12 @@ final class LDACController: ObservableObject {
     @Published private(set) var driverState: LDACDriverInstaller.State
     @Published private(set) var driverInstallationError: String?
     @Published private(set) var isOpeningDriverInstaller = false
+    /// Headphones whose LDAC request waits for the user to choose between multipoint and LDAC.
+    @Published private(set) var multipointConflictAddress: String?
+    /// Headphones that are turning multipoint off before LDAC starts.
+    @Published private(set) var multipointShutdownAddress: String?
+    private var multipointConflictConfiguration: LDACConfiguration?
+    private var multipointShutdownTask: Task<Void, Never>?
     private var didAttemptAutomaticDriverUpdate = false
     private let bundle: Bundle
     private let defaults: UserDefaults?
@@ -219,6 +225,12 @@ final class LDACController: ObservableObject {
                 state = .failed(String(localized: "LDAC playback is unavailable in this installation of Acouplet."))
                 return
             }
+            if !isSessionRunning, devices?.controller(for: address)?.ldacRequiresMultipointOff == true {
+                guard multipointShutdownAddress == nil else { return }
+                multipointConflictConfiguration = configuration
+                multipointConflictAddress = address
+                return
+            }
             requestedAddress = address
             if !isSessionRunning { start(address) }
             else { stopSession(reason: "target changed") }
@@ -227,6 +239,52 @@ final class LDACController: ObservableObject {
             suspensionRequested = false
             if isSessionRunning { stopSession(reason: "user disabled LDAC") }
             else { state = .off; targetAddress = nil; resumeIfReady() }
+        }
+    }
+
+    /// Answers the multipoint question for a waiting LDAC request. Keeping multipoint leaves LDAC off;
+    /// turning it off waits for the headphones to confirm the change, which restarts them, and then starts LDAC.
+    func resolveMultipointConflict(turnOffMultipoint: Bool) {
+        guard let address = multipointConflictAddress else { return }
+        let configuration = multipointConflictConfiguration
+        multipointConflictAddress = nil
+        multipointConflictConfiguration = nil
+        guard turnOffMultipoint else { return }
+        let failure = String(localized: "Multipoint could not be turned off. LDAC did not start.")
+        guard let headphones = devices?.controller(for: address), headphones.ldacRequiresMultipointOff else {
+            setEnabled(true, forAddress: address, configuration: configuration)
+            return
+        }
+        headphones.setMultipointEnabled(false)
+        guard let transition = headphones.multipointTransition, !transition.isFinished, !transition.targetEnabled else {
+            targetAddress = address
+            state = .failed(headphones.multipointUnavailableReason ?? failure)
+            return
+        }
+        let requestID = transition.requestID
+        multipointShutdownAddress = address
+        record("multipoint-off-requested", reason: "model=\(headphones.deviceModel.rawValue)")
+        multipointShutdownTask = Task { [weak self] in
+            let deadline = Date().addingTimeInterval(90)
+            while !Task.isCancelled, Date() < deadline {
+                guard let current = headphones.multipointTransition, current.requestID == requestID, !current.isFinished else { break }
+                // The user already chose to turn multipoint off, so confirm the headphones' own prompt for that change.
+                if let alert = current.alert {
+                    headphones.respondToMultipointAlert(alert, action: alert.availableActions.contains(.positive) ? .positive : nil)
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.multipointShutdownAddress = nil
+            self.multipointShutdownTask = nil
+            if headphones.multipointTransition?.requestID == requestID, headphones.multipointTransition?.phase == .complete,
+               headphones.systemFeatures.multipoint?.enabled == false {
+                self.record("multipoint-off-confirmed", reason: "starting LDAC")
+                self.setEnabled(true, forAddress: address, configuration: configuration)
+            } else {
+                self.targetAddress = address
+                self.state = .failed(headphones.multipointTransition?.failureMessage ?? failure)
+            }
         }
     }
 
@@ -326,7 +384,7 @@ final class LDACController: ObservableObject {
               let headphones = devices?.controller(for: address),
               canResumeRecovery(with: headphones),
               devices?.selectedAddress == address, headphones.isDeviceConnected,
-              deviceUnavailableReason(forAddress: address) == nil,
+              deviceUnavailableReason(forAddress: address) == nil, !headphones.ldacRequiresMultipointOff,
               let resumeOutputUID, audioRoute?.route?.uid == resumeOutputUID,
               headphones.hasCurrentMusicSourceContext(for: IOBluetoothHostController.default()?.addressAsString()) else { return }
         refreshDriverState()

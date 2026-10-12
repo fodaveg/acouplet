@@ -463,6 +463,10 @@ enum SonyDeviceModel: String, CaseIterable, Sendable {
 
     var isEarbuds: Bool { formFactor == .earbuds }
 
+    /// Models that stop offering an LDAC audio endpoint while multipoint is on. A WH-1000XM4 on firmware 3.0.1 warns
+    /// with MDR v1 alert 0x06 when multipoint is turned on and then lists only SBC and AAC sinks.
+    var offersLDACOnlyWithoutMultipoint: Bool { self == .whXM4 }
+
     var isSpeaker: Bool {
         switch formFactor {
         case .neckbandSpeaker, .portableSpeaker, .towerSpeaker: true

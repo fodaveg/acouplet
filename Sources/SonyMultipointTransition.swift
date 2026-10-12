@@ -28,17 +28,19 @@ struct SonyMultipointTransition: Equatable, Sendable {
     private var receivedAlertCount = 0
     private var soundQualityWarningConfirmed = false
 
+    /// The setter in the headphones' own protocol generation, fixed when the change is requested.
+    let requestPayload: [UInt8]
+
     init?(enabled: Bool, model: SonySystemFeatures, session: UInt64, requestID: UUID = UUID()) {
         guard let slot = model.multipointSlot, let original = model.multipoint?.enabled,
-              original != enabled, model.multipointSetPayload(enabled: enabled) != nil else { return nil }
+              original != enabled, let payload = model.multipointSetPayload(enabled: enabled) else { return nil }
         self.requestID = requestID
         originalEnabled = original
         targetEnabled = enabled
+        requestPayload = payload
         self.slot = slot
         self.session = session
     }
-
-    var requestPayload: [UInt8] { [0xD8, slot, 0x00, targetEnabled ? 0x00 : 0x01] }
 
     var expectedPayload: [UInt8]? {
         switch phase {

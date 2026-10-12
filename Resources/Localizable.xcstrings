@@ -7018,6 +7018,108 @@
         }
       }
     },
+    "Turn off multipoint for LDAC?": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC için çoklu bağlantı kapatılsın mı?"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn off multipoint for LDAC?"
+          }
+        }
+      }
+    },
+    "These headphones offer LDAC only when multipoint is off. Turning it off restarts them and disconnects any other device.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bu kulaklıklar LDAC'yi yalnızca çoklu bağlantı kapalıyken sunar. Kapatmak kulaklıkları yeniden başlatır ve diğer cihazların bağlantısını keser."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "These headphones offer LDAC only when multipoint is off. Turning it off restarts them and disconnects any other device."
+          }
+        }
+      }
+    },
+    "Turn Off Multipoint": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Çoklu Bağlantıyı Kapat"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn Off Multipoint"
+          }
+        }
+      }
+    },
+    "Keep Multipoint": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Çoklu Bağlantıyı Koru"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep Multipoint"
+          }
+        }
+      }
+    },
+    "Turning off multipoint…": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Çoklu bağlantı kapatılıyor…"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turning off multipoint…"
+          }
+        }
+      }
+    },
+    "Multipoint could not be turned off. LDAC did not start.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Çoklu bağlantı kapatılamadı. LDAC başlatılmadı."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Multipoint could not be turned off. LDAC did not start."
+          }
+        }
+      }
+    },
     "Multipoint changed before your cancellation could be confirmed.": {
       "extractionState": "manual",
       "localizations": {

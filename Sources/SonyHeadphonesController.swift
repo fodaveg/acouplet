@@ -550,6 +550,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         return nil
     }
 
+    /// Whether LDAC needs multipoint turned off first on these headphones.
+    var ldacRequiresMultipointOff: Bool {
+        deviceModel.offersLDACOnlyWithoutMultipoint && systemFeatures.multipoint?.enabled == true
+    }
+
     var multipointUnavailableReason: String? {
         guard !isRunningHeadphoneTest else { return String(localized: "Finish the current headphone test first.") }
         guard powerOffState == nil else { return String(localized: "Connect the headphones to change settings.") }
@@ -2179,7 +2184,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private func requestAudioFeatures() {
         if let legacyControls {
             for payload in legacyControls.dsee.queryPayloads + legacyControls.connectionQuality.queryPayloads + legacyControls.wearingControl.queryPayloads
-                + (legacyControls.automaticPowerOff?.queryPayloads ?? []) + touchAssignments.queryPayloads { send(payload) }
+                + (legacyControls.automaticPowerOff?.queryPayloads ?? []) + touchAssignments.queryPayloads + systemFeatures.queryPayloads { send(payload) }
             for payload in legacySurround.queryPayloads + legacySoundPosition.queryPayloads { send(payload) }
             for payload in playback.queryPayloads {
                 if payload == playback.capabilityQueryPayload, playback.hasReceivedCapabilities { continue }
@@ -4964,6 +4969,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                   (legacyControls?.allows(payload) ?? [[0x04, 0x01], [0x04, 0x03], [0x06, 0x00]].contains(payload))
                     || isEqualizerQuery || equalizer.acceptsSetPayload(payload) || isTouchAssignment || isConnectionAlert
                     || isSoundEffectQuery || legacySurround.acceptsSetPayload(payload) || legacySoundPosition.acceptsSetPayload(payload)
+                    || systemFeatures.queryPayloads.contains(payload) || payload == multipointTransition?.expectedPayload
                     || playback.queryPayloads.contains(payload)
                     || (payload.first == 0xA8 && payload.last.flatMap { playback.volumePayload(Int($0)) } == payload)
                     || firmwareUpdateQueries[payload] != nil
@@ -6722,6 +6728,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             let hidden = hex(Set(payload.dropFirst(3)).subtracting(controls.supportedFunctions))
             Self.logger.info("MDR v1 support functions=\(reported, privacy: .public) hidden=\(hidden, privacy: .public) model=\(self.deviceModel.rawValue, privacy: .public)")
             legacyControls = controls
+            systemFeatures = SonySystemFeatures(legacyGeneralSettings: controls.supportedFunctions)
             legacyOptimizer = SonyLegacyOptimizer(supportedFunctions: controls.supportedFunctions)
             legacySurround = SonyLegacySoundEffect(kind: .surround, supportedFunctions: controls.supportedFunctions)
             legacySoundPosition = SonyLegacySoundEffect(kind: .soundPosition, supportedFunctions: controls.supportedFunctions)
@@ -6753,6 +6760,14 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         if let alert = SonyConnectionAlert(payload: payload, generation: .v1) {
             lastConnectionAlert = alert
             lastSyncDate = Date()
+            if alert.isMultipointChange || multipointTransition?.isFinished == false {
+                Self.logger.notice("Multipoint alert; session=\(self.controlSession) format=\(alert.format.rawValue) message=\(alert.messageID) action=\(String(describing: alert.actionType), privacy: .public) phase=\(self.multipointTransition?.diagnosticPhase ?? "none", privacy: .public)")
+            }
+            if multipointTransition?.receiveAlert(alert, session: controlSession) == true {
+                multipointReadbacks = multipointReadbacks.map { ($0.slot, nil) }
+                advanceMultipointTransition()
+                return
+            }
             if connectionTransition?.receiveAlert(alert, session: controlSession) == true {
                 if systemReads[[0xE6, 1]]?.transmitted == true {
                     systemReads[[0xE6, 1]]?.isObsolete = true
@@ -6766,6 +6781,25 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         if receiveLegacyConnectionQuality(payload) { return }
         if receiveTouchAssignments(payload) { return }
         if receiveSystemFeatures(payload) { return }
+        if [0xD1, 0xD3, 0xD5, 0xD7, 0xD9].contains(payload[0]) {
+            let previous = (systemFeatures.multipointSlot, systemFeatures.multipoint)
+            defer {
+                if previous.0 != systemFeatures.multipointSlot || previous.1 != systemFeatures.multipoint {
+                    let available = systemFeatures.multipoint?.available.map { $0 ? "yes" : "no" } ?? "unknown"
+                    let enabled = systemFeatures.multipoint?.enabled.map { $0 ? "on" : "off" } ?? "unknown"
+                    Self.logger.info("MDR v1 multipoint; slot=\(self.systemFeatures.multipointSlot.map { String(format: "%02X", $0) } ?? "none", privacy: .public) available=\(available, privacy: .public) enabled=\(enabled, privacy: .public)")
+                }
+            }
+            if receiveGeneralSetting(payload) { return }
+            var receivedSystemFeatures = systemFeatures
+            let updatedSystemFeatures = receivedSystemFeatures.update(payload)
+            if systemFeatures != receivedSystemFeatures { systemFeatures = receivedSystemFeatures }
+            if updatedSystemFeatures || (payload[0] == 0xD7 && payload[1] == multipointTransition?.slot) {
+                if updatedSystemFeatures { lastSyncDate = Date() }
+                receiveMultipointSetting(payload)
+            }
+            return
+        }
         if receiveLegacyOptimizer(payload) { return }
         if receiveLegacySoundEffect(payload) { return }
         if [0x51, 0x53, 0x55, 0x5B, 0x57, 0x59].contains(payload[0]), payload[1] == equalizer.inquiryType {

@@ -1929,3 +1929,118 @@ final class SonyLegacyControllerTests: XCTestCase {
         XCTFail("The simulated command queue did not drain.")
     }
 }
+
+@MainActor
+final class SonyLegacyMultipointTests: XCTestCase {
+    private let address = "02:53:4F:4E:59:01"
+    // Replies captured from a WH-1000XM4 (MDR v1, firmware 3.0.1).
+    private let multipointIdentity: [UInt8] = [0xD1, 0xD2, 0x02, 0x12] + Array("MULTIPOINT_SETTING".utf8)
+        + [0x1A] + Array("MULTIPOINT_SETTING_SUMMARY".utf8) + [0x01, 0x00]
+
+    func testWHXM4ReadsAndChangesMultipointOverMDRV1() throws {
+        let (_, headphones) = try preparedXM4(multipointEnabled: false)
+        defer { headphones.simulateControlLoss() }
+        XCTAssertEqual(headphones.systemFeatures.multipointSlot, 0xD2)
+        XCTAssertEqual(headphones.systemFeatures.multipoint?.enabled, false)
+        XCTAssertNotNil(MultipointSettingControl.enabled(for: headphones))
+        XCTAssertNil(headphones.multipointUnavailableReason)
+        XCTAssertFalse(headphones.ldacRequiresMultipointOff)
+        let sent = headphones.simulatedTransmittedFrames.map(\.payload)
+        XCTAssertTrue(sent.contains([0xD0, 0xD2, 0x01]))
+        XCTAssertTrue(sent.contains([0xD6, 0xD2]))
+
+        headphones.setMultipointEnabled(true)
+        XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0xD8, 0xD2, 0x01, 0x01])
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0x99, 0x01, 0x06, 0x01])
+        let alert = try XCTUnwrap(headphones.multipointTransition?.alert)
+        XCTAssertEqual(alert.format, .legacyFixed)
+        XCTAssertEqual(alert.messageID, 0x06)
+        headphones.respondToMultipointAlert(alert, action: .positive)
+        XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0x98, 0x01, 0x06, 0x01])
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0xD9, 0xD2, 0x01, 0x01])
+        XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0xD6, 0xD2])
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0xD7, 0xD2, 0x01, 0x01])
+        XCTAssertEqual(headphones.multipointTransition?.phase, .complete)
+        XCTAssertEqual(headphones.systemFeatures.multipoint?.enabled, true)
+        XCTAssertTrue(headphones.ldacRequiresMultipointOff)
+    }
+
+    func testOnlyTheWHXM4NeedsMultipointOffForLDAC() {
+        XCTAssertEqual(SonyDeviceModel.allCases.filter(\.offersLDACOnlyWithoutMultipoint), [.whXM4])
+    }
+
+    func testLDACAsksBeforeTurningMultipointOffAndKeepingItChangesNothing() async throws {
+        let (coordinator, headphones) = try preparedXM4(multipointEnabled: true)
+        defer { headphones.simulateControlLoss() }
+        let ldac = LDACController(devices: coordinator, inspectDriver: { _ in .current })
+        XCTAssertTrue(headphones.ldacRequiresMultipointOff)
+        let frames = headphones.simulatedTransmittedFrames.count
+
+        ldac.setEnabled(true, forAddress: address)
+        XCTAssertEqual(ldac.multipointConflictAddress, address)
+        XCTAssertFalse(ldac.isSessionRunning)
+        XCTAssertEqual(ldac.state, .off)
+        ldac.resolveMultipointConflict(turnOffMultipoint: false)
+        XCTAssertNil(ldac.multipointConflictAddress)
+        XCTAssertNil(ldac.multipointShutdownAddress)
+        XCTAssertFalse(ldac.isSessionRunning)
+        XCTAssertNil(headphones.multipointTransition)
+        XCTAssertEqual(headphones.simulatedTransmittedFrames.count, frames)
+        XCTAssertEqual(headphones.systemFeatures.multipoint?.enabled, true)
+
+        ldac.setEnabled(true, forAddress: address)
+        ldac.resolveMultipointConflict(turnOffMultipoint: true)
+        XCTAssertNil(ldac.multipointConflictAddress)
+        XCTAssertEqual(ldac.multipointShutdownAddress, address)
+        XCTAssertFalse(ldac.isSessionRunning)
+        XCTAssertEqual(headphones.multipointTransition?.targetEnabled, false)
+        XCTAssertEqual(headphones.simulatedPendingFrame?.payload, [0xD8, 0xD2, 0x01, 0x00])
+        ldac.setEnabled(true, forAddress: address)
+        XCTAssertNil(ldac.multipointConflictAddress)
+
+        headphones.simulateMultipointTimeout()
+        XCTAssertEqual(headphones.multipointTransition?.phase, .failed)
+        for _ in 0..<40 where ldac.multipointShutdownAddress != nil { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertNil(ldac.multipointShutdownAddress)
+        XCTAssertFalse(ldac.isSessionRunning)
+        guard case .failed = ldac.state else { return XCTFail("A failed multipoint change must not start LDAC") }
+        XCTAssertEqual(ldac.targetAddress, address)
+    }
+
+    private func preparedXM4(multipointEnabled: Bool) throws -> (SonyDeviceCoordinator, SonyHeadphonesController) {
+        let coordinator = SonyDeviceCoordinator(fallbackController: SonyHeadphonesController(startAutomatically: false, simulated: true)) { device in
+            SonyHeadphonesController(startAutomatically: false, simulated: true, pinnedAddress: device.address, advertisedName: device.name)
+        }
+        coordinator.reconcileConnectedDevices([try XCTUnwrap(SonyConnectedDevice(address: address, name: "WH-1000XM4", model: .whXM4))])
+        let headphones = try XCTUnwrap(coordinator.controller(for: address))
+        headphones.simulateDeviceConnection(named: "WH-1000XM4", controlBusy: true, simulatedAddress: address)
+        headphones.simulateProtocolMessage([0x01, 0, 0x70, 0], beginConnection: true)
+        acknowledgeAll(headphones)
+        let name = Array("WH-1000XM4".utf8)
+        headphones.simulateProtocolMessage([0x05, 1, UInt8(name.count)] + name)
+        headphones.simulateProtocolMessage([0x05, 3, 0x30, 0x01])
+        headphones.simulateProtocolMessage([0x07, 0, 3, 0x11, 0xA1, 0xD2])
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0x05, 2, 5] + Array("3.0.1".utf8))
+        XCTAssertTrue(headphones.isReady)
+        XCTAssertEqual(headphones.deviceModel, .whXM4)
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage(multipointIdentity)
+        acknowledgeAll(headphones)
+        headphones.simulateProtocolMessage([0xD3, 0xD2, 0x00])
+        headphones.simulateProtocolMessage([0xD7, 0xD2, 0x01, multipointEnabled ? 0x01 : 0x00])
+        acknowledgeAll(headphones)
+        return (coordinator, headphones)
+    }
+
+    private func acknowledgeAll(_ controller: SonyHeadphonesController) {
+        for _ in 0..<100 {
+            guard let frame = controller.simulatedPendingFrame else { return }
+            controller.simulateProtocolData(SonyFrameCodec.encode(type: 0x01, sequence: 1 - frame.sequence, payload: []))
+        }
+        XCTFail("The simulated command queue did not drain.")
+    }
+}

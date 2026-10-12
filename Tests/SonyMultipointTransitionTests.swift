@@ -510,6 +510,74 @@ final class SonyMultipointTransitionTests: XCTestCase {
         XCTAssertNil(newRequest.expectedPayload)
     }
 
+    // Replies captured from a WH-1000XM4 (MDR v1, firmware 3.0.1).
+    private static let legacyTouchPanel: [UInt8] = [0xD1, 0xD1, 0x02, 0x13] + Array("TOUCH_PANEL_SETTING".utf8) + [0x00, 0x01, 0x00]
+    private static let legacyMultipoint: [UInt8] = [0xD1, 0xD2, 0x02, 0x12] + Array("MULTIPOINT_SETTING".utf8)
+        + [0x1A] + Array("MULTIPOINT_SETTING_SUMMARY".utf8) + [0x01, 0x00]
+
+    func testLegacyGeneralSettingsUseTheV1LayoutAndOneForOn() throws {
+        var model = SonySystemFeatures(legacyGeneralSettings: [0x11, 0x62, 0xD1, 0xD2, 0xF4])
+        XCTAssertEqual(model.generation, .v1)
+        XCTAssertNil(model.voiceAssistant)
+        XCTAssertNil(model.automaticPowerOff)
+        XCTAssertEqual(model.queryPayloads, [[0xD0, 0xD1, 0x01], [0xD0, 0xD2, 0x01]])
+        XCTAssertTrue(model.update(Self.legacyTouchPanel))
+        XCTAssertNil(model.multipointSlot)
+        XCTAssertTrue(model.update(Self.legacyMultipoint))
+        XCTAssertEqual(model.multipointSlot, 0xD2)
+        XCTAssertTrue(model.generalSettingsAreIdentified)
+        XCTAssertEqual(model.queryPayloads, [[0xD2, 0xD2], [0xD6, 0xD2]])
+        XCTAssertTrue(model.update([0xD3, 0xD2, 0x00]))
+        XCTAssertFalse(model.update([0xD7, 0xD2, 0x00, 0x01]))
+        XCTAssertTrue(model.update([0xD7, 0xD2, 0x01, 0x01]))
+        XCTAssertEqual(model.multipoint?.enabled, true)
+        XCTAssertEqual(model.multipointSetPayload(enabled: false), [0xD8, 0xD2, 0x01, 0x00])
+        XCTAssertTrue(model.update([0xD9, 0xD2, 0x01, 0x00]))
+        XCTAssertEqual(model.multipoint?.enabled, false)
+        XCTAssertEqual(model.multipointSetPayload(enabled: true), [0xD8, 0xD2, 0x01, 0x01])
+        XCTAssertTrue(model.update([0xD7, 0xD2, 0x01, 0x02]))
+        XCTAssertNil(model.multipoint?.enabled)
+        XCTAssertNil(model.multipointSetPayload(enabled: true))
+
+        var malformed = SonySystemFeatures(legacyGeneralSettings: [0xD2])
+        XCTAssertFalse(malformed.update(Array(Self.legacyMultipoint.dropLast())))
+        XCTAssertFalse(malformed.update(Array(Self.legacyMultipoint.dropLast(2))))
+        var modern = SonySystemFeatures(supportedFunctions: [0xD2])
+        XCTAssertFalse(modern.update(Self.legacyMultipoint))
+        XCTAssertNil(modern.multipointSlot)
+    }
+
+    func testLegacyMultipointEnableUsesV1SetterAndAcceptsTheLDACWarning() throws {
+        var state = SonySystemFeatures(legacyGeneralSettings: [0xD2])
+        state.update(Self.legacyMultipoint)
+        state.update([0xD3, 0xD2, 0x00])
+        state.update([0xD7, 0xD2, 0x01, 0x00])
+        var transition = try XCTUnwrap(SonyMultipointTransition(enabled: true, model: state, session: 1))
+        XCTAssertEqual(transition.requestPayload, [0xD8, 0xD2, 0x01, 0x01])
+        XCTAssertEqual(transition.expectedPayload, [0xD8, 0xD2, 0x01, 0x01])
+        XCTAssertTrue(transition.commandTransmitted([0xD8, 0xD2, 0x01, 0x01], model: state, session: 1))
+        let warning = try XCTUnwrap(SonyConnectionAlert(payload: [0x99, 0x01, 0x06, 0x01], generation: .v1))
+        XCTAssertTrue(warning.isMultipointChange)
+        XCTAssertFalse(warning.isLegacyConnectionChange)
+        XCTAssertNil(SonyConnectionAlert(payload: [0x99, 0x01, 0x06, 0x01]))
+        XCTAssertTrue(transition.receiveAlert(warning, session: 1))
+        XCTAssertEqual(transition.alert, warning)
+        XCTAssertEqual(transition.respond(to: warning, action: .positive), [0x98, 0x01, 0x06, 0x01])
+        XCTAssertTrue(transition.commandTransmitted([0x98, 0x01, 0x06, 0x01], model: state, session: 1))
+        XCTAssertTrue(transition.controlLost(session: 1))
+        var restarted = SonySystemFeatures(legacyGeneralSettings: [0xD2])
+        restarted.update(Self.legacyMultipoint)
+        XCTAssertTrue(transition.controlReady(model: restarted, session: 2))
+        XCTAssertEqual(transition.expectedPayload, [0xD6, 0xD2])
+        XCTAssertTrue(transition.commandTransmitted([0xD6, 0xD2], model: restarted, session: 2))
+        XCTAssertTrue(transition.receiveReadback([0xD7, 0xD2, 0x01, 0x01], model: restarted, session: 2, readbackOwned: true))
+        XCTAssertEqual(transition.phase, .complete)
+
+        let off = try XCTUnwrap(SonyMultipointTransition(enabled: false, model: { var on = state; on.update([0xD7, 0xD2, 0x01, 0x01]); return on }(), session: 3))
+        XCTAssertEqual(off.requestPayload, [0xD8, 0xD2, 0x01, 0x00])
+        XCTAssertFalse(SonyConnectionAlert(payload: [0x99, 0x01, 0x07, 0x01], generation: .v1)!.isMultipointChange)
+    }
+
     private func model(enabled: Bool? = false, slot: UInt8 = 0xD2, available: Bool? = true) -> SonySystemFeatures {
         var model = SonySystemFeatures(supportedFunctions: [slot])
         let title = Array("MULTIPOINT_SETTING".utf8)
