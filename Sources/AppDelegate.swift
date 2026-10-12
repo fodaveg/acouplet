@@ -265,6 +265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }) {
             return .terminateLater
         }
+        // Restoring LDAC reconnects the ACL; from here on nothing may open a new RFCOMM channel,
+        // or the open races the process exit and leaves the headphones without a control channel.
+        environment.devices.beginTermination()
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         if environment.ldac.needsStopBeforeTermination {
             environment.ldac.stop(reason: "app is terminating") { [weak self] in
@@ -275,6 +278,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
         #endif
+        // Never exit with an RFCOMM open or close in flight: bluetoothd ignores a close sent while the
+        // open is pending. Bounded to 1.5 s per controller.
+        if environment.devices.drainRFCOMMForTermination(completion: { [weak self] in
+            guard let self else { sender.reply(toApplicationShouldTerminate: true); return }
+            let reply = self.applicationShouldTerminate(sender)
+            if reply != .terminateLater { sender.reply(toApplicationShouldTerminate: reply == .terminateNow) }
+        }) {
+            return .terminateLater
+        }
         let controllers = environment.devices.controllers.filter {
             $0.earTipFitTransition?.canDismiss == false || $0.headGesturePracticeTransition?.canDismiss == false
                 || $0.legacyOptimizerTransition?.canDismiss == false
@@ -299,6 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self?.testTerminationObserver = nil
                 if interrupted != nil {
+                    self?.environment.devices.cancelTermination()
                     self?.retriesBackgroundServiceMigration = false
                     self?.isSystemTerminating = false
                 }
@@ -326,6 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 environment.settings.backgroundServiceMigrationError = Self.backgroundServiceMigrationMessage
                 environment.devices.resetEarbudFindingTermination()
                 environment.devices.systemDidWake()
+                environment.devices.cancelTermination()
                 environment.settings.selectedSettingsPane = "general"
                 showSettings()
                 isSystemTerminating = false

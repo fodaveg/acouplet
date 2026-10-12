@@ -80,6 +80,7 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
     @Published var isDiscovering = false
     @Published var isSystemSleeping = false
     @Published var isRunning = false
+    private(set) var isTerminating = false
     var reconnectAutomatically = true
     var reconnectSuppressedAddress: String?
     var retiredControllerAddresses: Set<String> = []
@@ -187,6 +188,43 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
             else { finder.dismiss() }
         }
         return true
+    }
+
+    /// Forbids new RFCOMM channels on every controller, including ones created while quitting.
+    /// Safe to call repeatedly; call it before LDAC restoration reconnects the ACL.
+    func beginTermination() {
+        isTerminating = true
+        for controller in terminationControllers { controller.beginTermination() }
+    }
+
+    /// Undoes `beginTermination()` when the quit is cancelled.
+    func cancelTermination() {
+        isTerminating = false
+        for controller in terminationControllers { controller.cancelTermination() }
+    }
+
+    /// Closes every control channel and waits (bounded) for in-flight opens and closes.
+    /// Returns `true` when `completion` will run later; `false` when nothing was pending.
+    func drainRFCOMMForTermination(completion: @escaping @MainActor () -> Void) -> Bool {
+        var remaining = 0
+        var finished = false
+        var waiting = false
+        let leave: @MainActor () -> Void = {
+            remaining -= 1
+            if remaining == 0, waiting, !finished { finished = true; completion() }
+        }
+        for controller in terminationControllers {
+            remaining += 1
+            if !controller.drainRFCOMMForTermination(completion: leave) { remaining -= 1 }
+        }
+        waiting = true
+        return remaining > 0
+    }
+
+    private var terminationControllers: [SonyHeadphonesController] {
+        var all = controllers
+        if !all.contains(where: { $0 === fallbackController }) { all.append(fallbackController) }
+        return all
     }
 
     func resetEarbudFindingTermination() {
@@ -337,6 +375,7 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
     }
 
     private func retain(_ controller: SonyHeadphonesController, for device: SonyConnectedDevice) {
+        if isTerminating { controller.beginTermination() }
         controllersByAddress[device.address] = controller
         devicesByAddress[device.address] = device
         observations[device.address] = controller.objectWillChange.sink { [weak self] _ in

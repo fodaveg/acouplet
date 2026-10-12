@@ -563,6 +563,68 @@ final class SonyConnectionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationBlocksEveryNewClassicOpen() {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        controller.simulateBluetoothInitialization()
+        let device = ServiceDiscoveryDevice()
+        device.service = ServiceDiscoveryRecord()
+        controller.simulateSonyLink(to: device)
+        XCTAssertEqual(device.openedChannels, [7])
+        controller.simulateControlLoss()
+
+        controller.beginTermination()
+        XCTAssertFalse(controller.retryControlsIfNeeded())
+        controller.refresh()
+        controller.simulateSonyLink(to: device)
+        XCTAssertEqual(device.openedChannels, [7], "No RFCOMM channel may open once the app is terminating")
+
+        controller.cancelTermination()
+        controller.simulateSonyLink(to: device)
+        XCTAssertEqual(device.openedChannels, [7, 7], "A cancelled quit must restore normal reconnection")
+    }
+
+    @MainActor
+    func testTerminationWaitsForPendingOpenThenClosesTheChannel() async {
+        let channel = DeferredRFCOMMChannel()
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        let device = ServiceDiscoveryDevice()
+        device.service = ServiceDiscoveryRecord()
+        device.channel = channel
+        controller.simulateSonyLink(to: device)
+        XCTAssertEqual(device.openedChannels, [7])
+
+        controller.beginTermination()
+        let drained = expectation(description: "Drain finished")
+        XCTAssertTrue(controller.drainRFCOMMForTermination { drained.fulfill() })
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(channel.closeCount, 0, "An in-flight open cannot be closed before it completes")
+
+        controller.classicChannelOpenComplete(channel, status: kIOReturnSuccess)
+        await fulfillment(of: [channel.closeFinished, drained], timeout: 2, enforceOrder: true)
+        XCTAssertEqual(channel.closeCount, 1)
+        XCTAssertTrue(channel.writes.isEmpty, "A terminating app must not start the handshake")
+        XCTAssertFalse(controller.drainRFCOMMForTermination { XCTFail("Nothing left to drain") })
+    }
+
+    @MainActor
+    func testTerminationDrainGivesUpWhenTheOpenNeverCompletes() async {
+        let channel = DeferredRFCOMMChannel()
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        defer { controller.simulateControlLoss() }
+        let device = ServiceDiscoveryDevice()
+        device.service = ServiceDiscoveryRecord()
+        device.channel = channel
+        controller.simulateSonyLink(to: device)
+        controller.terminationDrainTimeout = 0.1
+        controller.beginTermination()
+        let drained = expectation(description: "Drain gave up")
+        XCTAssertTrue(controller.drainRFCOMMForTermination { drained.fulfill() })
+        await fulfillment(of: [drained], timeout: 2)
+    }
+
+    @MainActor
     func testVisibleControlsRetryReopensOnlyAnIdleConnectedControlLink() {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         defer { controller.simulateControlLoss() }

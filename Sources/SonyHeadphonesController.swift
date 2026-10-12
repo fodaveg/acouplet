@@ -764,6 +764,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var bluetoothInitializationID: UUID?
     private var isBluetoothInitialized = false
     private var isSystemSleeping = false
+    private(set) var isTerminating = false
+    var terminationDrainTimeout: TimeInterval = 1.5
+    private var terminationDrainCompletion: (@MainActor () -> Void)?
+    private var terminationDrainExpired = false
+    /// Channel handed to `openRFCOMMChannelAsync` whose `rfcommChannelOpenComplete` has not arrived yet.
+    private var pendingOpenChannel: (any RFCOMMChannel)?
     private var retryWorkItem: DispatchWorkItem?
     private var ambientWorkItem: DispatchWorkItem?
     private var commandTimeoutWorkItem: DispatchWorkItem?
@@ -1673,7 +1679,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     func refresh() {
-        guard !isSystemSleeping, connectionTransition?.isFinished != false, multipointTransition?.isFinished != false,
+        guard !isSystemSleeping, !isTerminating, connectionTransition?.isFinished != false, multipointTransition?.isFinished != false,
               recoveryUsesBLE == nil else { return }
         cancelScheduledRetry(resetAttempts: true)
         if isReady, hasExpiredControlRead, powerOffState == nil, !isRunningHeadphoneTest,
@@ -1695,7 +1701,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     func retryControlsIfNeeded() -> Bool {
-        guard !displayOnly, !isSystemSleeping, isBluetoothInitialized, reconnectAutomatically,
+        guard !displayOnly, !isSystemSleeping, !isTerminating, isBluetoothInitialized, reconnectAutomatically,
               isDeviceConnected, powerOffState == nil, !isRunningHeadphoneTest,
               stage == .idle, channel == nil, bleTransport == nil, classicConnectionID == nil,
               serviceDiscoveries.isEmpty, recoveryUsesBLE == nil,
@@ -1709,6 +1715,54 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         cancelScheduledRetry(resetAttempts: false)
         openSonyLink(automatically: true)
         return true
+    }
+
+    /// Marks the app as quitting. Unlike `systemWillSleep()`, this leaves the controller otherwise
+    /// untouched (LDAC restoration still sees the headphones as connected) and only forbids
+    /// opening new RFCOMM channels, so no reconnection path can race the process exit.
+    func beginTermination() { isTerminating = true }
+
+    /// Re-enables RFCOMM opens after a quit was cancelled.
+    func cancelTermination() {
+        isTerminating = false
+        terminationDrainExpired = false
+    }
+
+    /// Retires the classic control channel before the process exits.
+    ///
+    /// An open that has not completed cannot be closed (the close is a no-op in bluetoothd and the
+    /// link then completes with no client), so it is closed as soon as `classicChannelOpenComplete`
+    /// reports it. Returns `true` when the caller must wait for `completion`, which runs on the
+    /// main queue after at most `terminationDrainTimeout` seconds.
+    func drainRFCOMMForTermination(completion: @escaping @MainActor () -> Void) -> Bool {
+        beginTermination()
+        guard !terminationDrainExpired, terminationDrainCompletion == nil else { return false }
+        guard pendingOpenChannel != nil || channel != nil || rfcommCloseCompletion.wait(timeout: .now()) != .success
+        else { return false }
+        terminationDrainCompletion = completion
+        DispatchQueue.main.asyncAfter(deadline: .now() + terminationDrainTimeout) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.terminationDrainCompletion != nil else { return }
+                self.terminationDrainExpired = true
+                self.finishTerminationDrain()
+            }
+        }
+        advanceTerminationDrain()
+        return true
+    }
+
+    private func advanceTerminationDrain() {
+        guard terminationDrainCompletion != nil, pendingOpenChannel == nil else { return }
+        if channel != nil { closeSonyLink() }
+        rfcommCloseCompletion.notify(queue: .main) { [weak self] in
+            MainActor.assumeIsolated { self?.finishTerminationDrain() }
+        }
+    }
+
+    private func finishTerminationDrain() {
+        guard let completion = terminationDrainCompletion else { return }
+        terminationDrainCompletion = nil
+        completion()
     }
 
     func systemWillSleep() {
@@ -2227,7 +2281,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private func refresh(shouldOpenLink: Bool, automatically: Bool = true) {
-        guard !displayOnly, !isSystemSleeping, powerOffState == nil, !isRunningHeadphoneTest else { return }
+        guard !displayOnly, !isSystemSleeping, !isTerminating, powerOffState == nil, !isRunningHeadphoneTest else { return }
         guard classicConnectionID == nil else { return }
         guard canRecoverDeviceAction else { return }
         if let transition = multipointTransition, !transition.isFinished || (transition.phase == .failed && multipointConnection != nil && !isReady) {
@@ -4498,7 +4552,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     private func openSonyLink(automatically: Bool = false, discoverServices: Bool = true) {
-        guard !isSystemSleeping, serviceDiscoveryID == nil else { return }
+        guard !isSystemSleeping, !isTerminating, serviceDiscoveryID == nil else { return }
         guard powerOffState == nil, !isRunningHeadphoneTest else { return }
         guard let device else { return }
         if automatically, stage == .idle, deviceActionTransition?.phase == .failed {
@@ -4536,6 +4590,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         let (result, openedChannel) = device.openSonyRFCOMMChannel(withChannelID: channelID, delegate: self)
         channel = openedChannel
+        pendingOpenChannel = result == kIOReturnSuccess ? openedChannel : nil
         if let openedChannel { channelIO = RFCOMMChannelIO(channel: openedChannel) }
         guard result == kIOReturnSuccess else {
             handleOpenFailure(result)
@@ -4614,6 +4669,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         earbudFinder?.dismiss(retiringTransport: true)
         classicConnectionID = nil
         pendingClassicOpenID = nil
+        pendingOpenChannel = nil
         serviceDiscoveryID = nil
         announcedAudioSourceAddress = nil
         #if !ACOUPLET_PUBLIC_APIS_ONLY
@@ -7694,6 +7750,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
 
     func classicChannelOpenComplete(_ rfcommChannel: any RFCOMMChannel, status error: IOReturn) {
         guard channel === rfcommChannel else { return }
+        if pendingOpenChannel === rfcommChannel { pendingOpenChannel = nil }
+        if isTerminating {
+            // The open was in flight when the app began quitting; it can be closed now that it completed.
+            if terminationDrainCompletion != nil { advanceTerminationDrain() } else { closeSonyLink() }
+            return
+        }
         guard error == kIOReturnSuccess else {
             handleOpenFailure(error)
             return
