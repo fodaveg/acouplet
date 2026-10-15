@@ -138,6 +138,18 @@ enum LDACSessionDiagnosticsCheck {
         let histories = try manager.contentsOfDirectory(at: finishing, includingPropertiesForKeys: nil)
             .filter { UUID(uuidString: $0.lastPathComponent) != nil }
         precondition(histories.count == 8)
-        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths")
+        let suite = "LDACSessionDiagnosticsCheck.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let control = LDACPriorityControl(request: { _, _ in }, state: { .init(phase: "idle", error: nil) })
+        var made = 0
+        precondition(!LDACPlaybackPriority.isDisabled(in: defaults))
+        precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) != nil && made == 1)
+        defaults.set(true, forKey: LDACPlaybackPriority.disabledKey)
+        precondition(LDACPlaybackPriority.isDisabled(in: defaults))
+        precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) == nil && made == 1)
+        defaults.removeObject(forKey: LDACPlaybackPriority.disabledKey)
+        precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) != nil && made == 2)
+        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths; the playback priority A/B switch skips the driver request only while set")
     }
 }

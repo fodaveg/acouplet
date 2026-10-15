@@ -95,6 +95,24 @@ struct LDACPriorityCleanupError: LocalizedError, Sendable {
     var errorDescription: String? { message }
 }
 
+/// Internal switch for the A/B test of the Bluetooth playback priority (audit L7, decision D4).
+/// `defaults write dev.baglayan.Acouplet LDACPlaybackPriorityDisabled -bool true` makes the next
+/// LDAC session skip every priority request to the driver, and `defaults delete` with the same key
+/// restores it. The owner process is the app binary, so it reads the app's own domain.
+enum LDACPlaybackPriority {
+    static let disabledKey = "LDACPlaybackPriorityDisabled"
+
+    static func isDisabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: disabledKey)
+    }
+
+    /// Returns nil without calling `make` while the switch disables the priority.
+    static func control(in defaults: UserDefaults = .standard,
+                        _ make: () throws -> LDACPriorityControl?) rethrows -> LDACPriorityControl? {
+        isDisabled(in: defaults) ? nil : try make()
+    }
+}
+
 final class LDACNativeSession: @unchecked Sendable {
     private enum PriorityPhase {
         case unused, configuring, configured, stopping, uncertain, removing, removed
@@ -344,6 +362,9 @@ final class LDACNativeSession: @unchecked Sendable {
                 try launch("restore", executable: helpers.connection, arguments: ["--address", address, "--restore"])
                 restoreDeadline = DispatchTime.now() + 52
             } else {
+                if priority == nil {
+                    record("PRIORITY_SKIPPED disabledByDefaults=\(LDACPlaybackPriority.isDisabled() ? 1 : 0) key=\(LDACPlaybackPriority.disabledKey)")
+                }
                 try launch("preflight", executable: helpers.capture, arguments: ["--check-permission"] + captureDeviceArguments)
                 deadline = DispatchTime.now() + 90
             }
@@ -792,7 +813,9 @@ final class LDACNativeSession: @unchecked Sendable {
                     }
                     if state.phase == "configured" {
                         priorityPhase = .configured
-                        record("PRIORITY_CONFIGURATION_ATTEMPT_COMPLETED controllerAcknowledgment=0")
+                        // The driver reports "configured" after any post of the global
+                        // AdaptiveJitterBufferChanged notification; nothing ties it to this link.
+                        record("PRIORITY_CONFIGURATION_ATTEMPT_COMPLETED driverPhase=configured evidence=global-notification controllerAcknowledgment=unmeasured")
                     }
                 }
                 if priority == nil || priorityPhase == .configured {
@@ -952,7 +975,7 @@ final class LDACNativeSession: @unchecked Sendable {
             if let error = state.error { throw LDACSessionError(error) }
             if state.phase == "idle" {
                 priorityPhase = .removed
-                record("PRIORITY_CLEANUP_ATTEMPT_COMPLETED controllerAcknowledgment=0")
+                record("PRIORITY_CLEANUP_ATTEMPT_COMPLETED driverPhase=idle evidence=driver-phase controllerAcknowledgment=unmeasured")
             } else if state.phase == "cleanup-required" || DispatchTime.now() >= priorityDeadline {
                 throw LDACSessionError("Bluetooth playback priority cleanup could not be confirmed.")
             }

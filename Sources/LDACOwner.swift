@@ -445,7 +445,7 @@ enum LDACOwnerWorker {
                     return
                 case .cancelStart: startCancelled = true; claimTask?.cancel()
                 case let .configure(volume, range, preserve): try output?.configure(volume: volume, range: range, preservingUserChange: preserve)
-                case .priority: priority = try output?.priorityControl()
+                case .priority: priority = try LDACPlaybackPriority.control { try output?.priorityControl() }
                 case .handoff:
                     if let output {
                         let state = output.routeRecovery
@@ -454,7 +454,9 @@ enum LDACOwnerWorker {
                         try output.selectForHandoff()
                     }
                 case .validate: try output?.validateForRecovery()
-                case .reconnect: priority = try output?.prepareForReconnect()
+                case .reconnect:
+                    priority = try LDACPlaybackPriority.control { try output?.prepareForReconnect() }
+                    if priority == nil { try output?.validateForRecovery() }
                 case .prepared: try output?.finishPreparation()
                 case .silence: output?.silence()
                 case let .start(id, configuration, recovery, restore):
