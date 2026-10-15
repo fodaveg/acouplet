@@ -152,7 +152,8 @@ static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSamp
     BOOL stateRead = thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&state, &stateCount) == KERN_SUCCESS;
     thread_time_constraint_policy_data_t constraint;
     mach_msg_type_number_t constraintCount = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
-    boolean_t constraintDefault = TRUE;
+    // FALSE asks for the thread's current policy; TRUE would always return the defaults.
+    boolean_t constraintDefault = FALSE;
     int realtime = thread_policy_get(thread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&constraint,
         &constraintCount, &constraintDefault) == KERN_SUCCESS ? !constraintDefault : -1;
     qos_class_t qos = QOS_CLASS_UNSPECIFIED;
@@ -378,6 +379,112 @@ static BOOL SelectProfile(uint32_t sampleRate, NSString *quality, LDACProfile *p
     return YES;
 }
 
+// Real-time scheduling for the sender thread. The L3 samples of 15 Oct 2026 showed the helper
+// clamped to priority 20 (the base of the utility QoS, inherited from a LaunchAgent without a
+// ProcessType) and the stalls spent runnable without a CPU. A thread under the time-constraint
+// policy, as Core Audio's IO threads are, is scheduled in the real-time band (97) even under that
+// clamp; only a darwin-background clamp demotes it. The budget follows the packet pacing: the period
+// is one packet, the computation a quarter of it (0.5 to 2 ms, far above the microseconds of work per
+// wake-up, since the loop sleeps every millisecond) and the constraint half of it.
+typedef struct {
+    double period;
+    double computation;
+    double constraint;
+} SenderRealtimeBudget;
+
+static SenderRealtimeBudget SenderRealtimeBudgetFor(LDACProfile profile, int mtu) {
+    // libldac packs (min(MTU, 679) - 18) / frame bytes frames per packet, 2 to 15. Adaptive streams
+    // can rise to the high-quality frame, the shortest packet, so they budget for that one.
+    int frameBytes = profile.adaptive ? 330 : profile.frameBytes;
+    int frames = frameBytes > 0 ? (MIN(mtu, 679) - 18) / frameBytes : 2;
+    frames = MAX(2, MIN(15, frames));
+    double period = (double)frames * profile.frameSamples / profile.sampleRate;
+    double computation = fmin(0.002, fmax(0.0005, period / 4));
+    return (SenderRealtimeBudget){period, computation, fmax(computation, period / 2)};
+}
+
+static uint32_t MachTicks(double seconds) {
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    return (uint32_t)llround(seconds * 1000000000.0 * timebase.denom / timebase.numer);
+}
+
+static kern_return_t ApplySenderRealtime(SenderRealtimeBudget budget) {
+    thread_time_constraint_policy_data_t policy = {MachTicks(budget.period), MachTicks(budget.computation),
+        MachTicks(budget.constraint), TRUE};
+    return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                             (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+static kern_return_t ReleaseSenderRealtime(void) {
+    thread_standard_policy_data_t policy = {0};
+    return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_STANDARD_POLICY,
+                             (thread_policy_t)&policy, THREAD_STANDARD_POLICY_COUNT);
+}
+
+// Whether the calling thread runs in the real-time band now: the time-constraint policy is set and
+// the policy in effect is no longer timeshare. `priority` receives the current priority.
+static BOOL SenderRealtimeEffective(int *priority) {
+    thread_t thread = pthread_mach_thread_np(pthread_self());
+    thread_time_constraint_policy_data_t constraint;
+    mach_msg_type_number_t constraintCount = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t constraintDefault = FALSE;
+    thread_extended_info_data_t state = {0};
+    mach_msg_type_number_t stateCount = THREAD_EXTENDED_INFO_COUNT;
+    if (thread_policy_get(thread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&constraint, &constraintCount,
+            &constraintDefault) != KERN_SUCCESS ||
+        thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&state, &stateCount) != KERN_SUCCESS) {
+        *priority = -1;
+        return NO;
+    }
+    *priority = state.pth_curpri;
+    return !constraintDefault && state.pth_policy != POLICY_TIMESHARE;
+}
+
+typedef struct {
+    BOOL applied;
+    BOOL effective;
+    BOOL effectiveAfterSleep;
+    BOOL released;
+    int priority;
+} RealtimeCheck;
+
+static void *RealtimeCheckThread(void *argument) {
+    RealtimeCheck *check = argument;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    LDACProfile profile;
+    if (!SelectProfile(96000, @"high", &profile)) return NULL;
+    check->applied = ApplySenderRealtime(SenderRealtimeBudgetFor(profile, 679)) == KERN_SUCCESS;
+    check->effective = SenderRealtimeEffective(&check->priority);
+    usleep(2000);
+    check->effectiveAfterSleep = SenderRealtimeEffective(&check->priority);
+    int released = 0;
+    check->released = ReleaseSenderRealtime() == KERN_SUCCESS && !SenderRealtimeEffective(&released);
+    return NULL;
+}
+
+// The helper's own thread is left alone: the policy is tried on a fresh thread, so the check also
+// shows whether a clamp on the process (taskpolicy, launchd) keeps it out of the real-time band.
+static BOOL RealtimeChecks(void) {
+    LDACProfile high, low, adaptive, cd;
+    if (!SelectProfile(96000, @"high", &high) || !SelectProfile(48000, @"low", &low) ||
+        !SelectProfile(48000, @"auto", &adaptive) || !SelectProfile(44100, @"mid", &cd)) return NO;
+    SenderRealtimeBudget budget = SenderRealtimeBudgetFor(high, 679);
+    BOOL passed = fabs(budget.period - 512.0 / 96000) < 1e-9 && fabs(budget.computation - budget.period / 4) < 1e-9 &&
+        fabs(budget.constraint - budget.period / 2) < 1e-9;
+    budget = SenderRealtimeBudgetFor(low, 2570);
+    passed &= fabs(budget.period - 768.0 / 48000) < 1e-9 && budget.computation == 0.002 && fabs(budget.constraint - 0.008) < 1e-9;
+    passed &= fabs(SenderRealtimeBudgetFor(adaptive, 679).period - 256.0 / 48000) < 1e-9;
+    budget = SenderRealtimeBudgetFor(cd, 679);
+    passed &= fabs(budget.period - 384.0 / 44100) < 1e-9 && budget.computation <= budget.constraint && budget.constraint < budget.period;
+    RealtimeCheck check = {0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, RealtimeCheckThread, &check) != 0 || pthread_join(thread, NULL) != 0) return NO;
+    printf("REALTIME_CHECK applied=%d effective=%d effectiveAfterSleep=%d priority=%d released=%d\n",
+           check.applied, check.effective, check.effectiveAfterSleep, check.priority, check.released);
+    return passed && check.applied && check.effective && check.effectiveAfterSleep && check.released;
+}
+
 static BOOL AdaptiveQuality(int eqmid) {
     return eqmid == LDACBT_EQMID_MQ || eqmid == LDACBT_EQMID_Q1 || eqmid == LDACBT_EQMID_Q0 ||
         eqmid == LDACBT_EQMID_SQ || eqmid == LDACBT_EQMID_HQ;
@@ -600,7 +707,8 @@ static BOOL SelfTest(void) {
     float input[256] = {0};
     float output[256] = {0};
     input[0] = 1; input[1] = -1;
-    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && ConvertPCM((const uint8_t *)input, 0.5, output);
+    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && RealtimeChecks() &&
+        ConvertPCM((const uint8_t *)input, 0.5, output);
     passed &= output[0] == 0.5 && output[1] == -0.5 && output[255] == 0;
     const float invalid[] = {NAN, INFINITY, -INFINITY};
     for (NSUInteger sample = 0; sample < 3; sample++) {
@@ -1076,6 +1184,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     id activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"LDAC streaming"];
     int qos = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     printf("STREAM_ACTIVITY qosStatus=%d\n", qos);
+    // The sender, PCM reads included, runs on this thread. If the policy is refused it streams as before.
+    SenderRealtimeBudget realtimeBudget = SenderRealtimeBudgetFor(probe.profile, probe.encoderMTU);
+    kern_return_t realtimeStatus = ApplySenderRealtime(realtimeBudget);
+    int realtimePriority = -1;
+    BOOL realtimeEffective = realtimeStatus == KERN_SUCCESS && SenderRealtimeEffective(&realtimePriority);
+    printf("REALTIME_POLICY requested=1 status=%d effective=%d priority=%d period=%.6f computation=%.6f constraint=%.6f\n",
+           realtimeStatus, realtimeEffective, realtimePriority, realtimeBudget.period, realtimeBudget.computation,
+           realtimeBudget.constraint);
     LDACProfile profile = probe.profile;
     LDACFrameFormat transmittedFormat = {profile.frameBytes, profile.bitrateKbps};
     LDACAdaptivePolicy adaptivePolicy = LDACAdaptivePolicyInit();
@@ -1486,6 +1602,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
            recovery.breached ? recovery.firstBreach - started : -1, recoveredWithinOneSecond, recoveryObserved,
            recovery.recovered ? recovery.recoveryTime - recovery.firstBreach : -1, limitStopped,
            probe.pcmSkippedBytes / 8, sentRTPSamples, generatedSamples >= sourceSamples ? generatedSamples - sourceSamples : 0);
+    if (realtimeStatus == KERN_SUCCESS) printf("REALTIME_POLICY_RELEASED status=%d\n", ReleaseSenderRealtime());
     [NSProcessInfo.processInfo endActivity:activity];
     return result == 0;
 }

@@ -19,6 +19,11 @@ for name, arguments in [
 
 for name in ['LDACSignaling', 'LDACMediaTransport']:
     subprocess.run([str(helpers / name), '--self-test'], check=True, timeout=15)
+# The LaunchAgent clamps the whole helper tree to the utility QoS; the sender's real-time policy must
+# still put a thread in the real-time band there.
+realtime = subprocess.run(['/usr/sbin/taskpolicy', '-c', 'utility', str(helpers / 'LDACMediaTransport'), '--self-test'],
+                          capture_output=True, text=True, timeout=15)
+assert realtime.returncode == 0 and 'REALTIME_CHECK applied=1 effective=1 effectiveAfterSleep=1' in realtime.stdout, realtime.stdout[-2000:]
 
 audio = helpers / 'Acouplet Audio.app/Contents/MacOS/AcoupletAudio'
 for arguments in [['capture.caf'], ['--sample-composition', 'capture.caf']]:
@@ -35,4 +40,4 @@ for binary, markers in [
 for argument in ['--check-stream-ring', '--check-stream-rates']:
     subprocess.run([str(audio), argument], check=True, timeout=15)
 
-print('LDAC helpers reject missing addresses and probe modes before device access; production artifacts exclude probe paths; offline self-checks passed.')
+print('LDAC helpers reject missing addresses and probe modes before device access; production artifacts exclude probe paths; offline self-checks passed, the sender thread reaches real-time scheduling under a utility clamp.')
