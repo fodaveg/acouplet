@@ -11,6 +11,8 @@ helper_entry = helper_entry.replace('            NSApplication.shared.setActivat
 quit_observation = delegate.split('        if [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut]', 1)[1].split('        } else if backgroundServiceMigrationError', 1)[0]
 quit_observation = 'if [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut]' + quit_observation + '        }'
 quit_cancellation = delegate.split('                if interrupted != nil {', 1)[1].split('                }', 1)[0].replace('self?.', '')
+# The fixture keeps only the delegate's own termination flags; device cleanup needs the app environment.
+quit_cancellation = ''.join(line for line in quit_cancellation.splitlines(keepends=True) if 'environment.' not in line)
 domain = f'gui/{os.getuid()}'
 label = 'dev.baglayan.Acouplet.migration-check.' + uuid.uuid4().hex
 helper_label = label + '.helper'
