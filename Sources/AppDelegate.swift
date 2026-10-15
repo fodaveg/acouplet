@@ -167,10 +167,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launchType = NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue
         let isDefaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool == true
-        if !CommandLine.arguments.contains("--background-service"),
-           isDefaultLaunch || CommandLine.arguments.contains("--manual-launch"),
-           (!isRunningTests || CommandLine.arguments.contains("--manual-launch")),
-           launchType != keyAELaunchedAsLogInItem, launchType != keyAELaunchedAsServiceItem {
+        let isFirstLaunchOfBuild = !isRunningTests && environment.settings.consumeFirstLaunch(
+            ofBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
+        if isFirstLaunchOfBuild || !CommandLine.arguments.contains("--background-service")
+            && (isDefaultLaunch || CommandLine.arguments.contains("--manual-launch"))
+            && (!isRunningTests || CommandLine.arguments.contains("--manual-launch"))
+            && launchType != keyAELaunchedAsLogInItem && launchType != keyAELaunchedAsServiceItem {
             showSettings()
         }
         environment.devices.$controllers

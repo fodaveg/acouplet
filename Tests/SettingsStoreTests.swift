@@ -316,6 +316,22 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testFirstLaunchOfEachBuildIsReportedOnceAcrossRelaunches() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(SettingsStore(defaults: defaults).consumeFirstLaunch(ofBuild: "41"))
+        let relaunched = SettingsStore(defaults: defaults)
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: "41"))
+        XCTAssertTrue(relaunched.consumeFirstLaunch(ofBuild: "42"), "An update opens Settings again")
+        XCTAssertFalse(SettingsStore(defaults: defaults).consumeFirstLaunch(ofBuild: "42"))
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: nil))
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: ""))
+        XCTAssertEqual(defaults.string(forKey: "lifecycle.lastLaunchedBuild"), "42")
+    }
+
+    @MainActor
     func testGlobalShortcutConflictRecoversAfterRegistrationIsReleased() throws {
         let first = GlobalHotKeyController {}
         let second = GlobalHotKeyController {}

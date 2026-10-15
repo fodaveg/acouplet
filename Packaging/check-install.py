@@ -113,7 +113,13 @@ elif name == 'launchctl':
         service = state[label]
         if args[0] == 'print':
             if not service['loaded']: sys.exit(1)
-            print('state = running\n\tprogram = ' + service['program'])
+            running = True
+            if mode in ('agent-exited', 'agent-stays-stopped') and label == 'dev.baglayan.Acouplet.agent' and service['version'] == 'new':
+                # The new service is running when the bootstrap returns, then quits before the installer finishes.
+                service['prints'] = service.get('prints', 0) + 1
+                state_file.write_text(json.dumps(state))
+                running = service['prints'] == 1 or service.get('kickstarted', False)
+            print(('state = running\n\tpid = 4242' if running else 'state = not running') + '\n\tprogram = ' + service['program'])
         else:
             if mode == 'stop-failure' or mode == 'legacy-stop-failure' and label == 'local.xm5control.native.agent': sys.exit(24)
             service['loaded'] = False
@@ -128,6 +134,11 @@ elif name == 'launchctl':
         version = (program.parents[2] / 'version').read_text()
         if mode in ('bootstrap-failure', 'matching-plist-failure', 'restore-plist-failure', 'login-item-rollback') and version == 'new' or mode == 'restart-failure' and version == 'old': sys.exit(25)
         state[config['Label']] = {'loaded': True, 'program': str(program), 'version': version}
+        state_file.write_text(json.dumps(state))
+    elif args[0] == 'kickstart':
+        service = state[args[1].split('/')[-1]]
+        assert service['loaded'], args
+        service['kickstarted'] = mode != 'agent-stays-stopped'
         state_file.write_text(json.dumps(state))
     else:
         raise AssertionError('Unexpected launchctl command: ' + str(args))
@@ -262,7 +273,8 @@ scenarios = ('helper-failure', 'success', 'matching-plist', 'matching-plist-fail
              'unrelated-legacy', 'repurposed-legacy', 'symlink-agent', 'orphan-service', 'concurrent-install',
              'native-quit-declined', 'native-quit-timeout', 'native-quit-stalled', 'native-partial-quit',
              'native-keepalive-relaunch', 'native-delayed-quit', 'login-item-rollback',
-             'controls-unregister-failure', 'embedded-controls', 'foreign-controls', 'ldac-owner-running')
+             'controls-unregister-failure', 'embedded-controls', 'foreign-controls', 'ldac-owner-running',
+             'agent-exited', 'agent-stays-stopped')
 for scenario in scenarios:
     with tempfile.TemporaryDirectory(prefix='acouplet-install-check-') as directory:
         root = Path(directory)
@@ -280,7 +292,8 @@ for scenario in scenarios:
         output = result.stdout + result.stderr
         state = json.loads((root / 'state.json').read_text())
         successful = scenario in ('success', 'matching-plist', 'fresh-install', 'inactive-update',
-                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success', 'ldac-owner-running')
+                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success', 'ldac-owner-running',
+                                  'agent-exited')
         assert (result.returncode == 0) == successful, (scenario, result.returncode, output)
         recovery_apps = [path for path in applications.glob('.*previous-*.app') if 'interrupted' not in path.name]
         recovery_plists = [path for path in agents.glob('*.previous-*') if 'interrupted' not in path.name]
@@ -295,10 +308,13 @@ for scenario in scenarios:
             assert len(recovery_plists) == 1, output
         else:
             assert not recovery_apps and not recovery_plists and not staged_apps, output
-            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure', 'native-register-failure') else 'old'
+            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure', 'native-register-failure', 'agent-stays-stopped') else 'old'
             assert (native / 'version').read_text() == expected, output
         if successful:
             assert json.loads((root / 'login-item.json').read_text())['enabled'] == (scenario == 'inactive-update'), output
+            assert ('running in the background (process 4242)' in output) == (scenario != 'inactive-update'), output
+            restarts = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines() if '"kickstart"' in line]
+            assert len(restarts) == (1 if scenario == 'agent-exited' else 0), restarts
             assert state[native_label]['loaded'] == (scenario != 'inactive-update'), state
             assert plistlib.loads(plist.read_bytes()) == {
                 'Label': native_label,
@@ -311,6 +327,9 @@ for scenario in scenarios:
             assert not state[legacy_label]['loaded'] and not (agents / (legacy_label + '.plist')).exists(), state
         elif scenario in ('legacy-unregister-failure', 'legacy-helper-failure'):
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new' and legacy.exists(), state
+        elif scenario == 'agent-stays-stopped':
+            assert state[native_label]['loaded'] and state[native_label]['version'] == 'new', state
+            assert 'background service is not running' in output and 'running in the background' not in output, output
         elif scenario == 'native-register-failure':
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new', state
             assert not state[legacy_label]['loaded'] and not legacy.exists(), state

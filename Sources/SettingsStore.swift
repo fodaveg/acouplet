@@ -130,6 +130,16 @@ final class SettingsStore: ObservableObject {
         refreshLaunchStatus()
     }
 
+    /// Returns true the first time a build runs, and records it so later launches of that build return false.
+    ///
+    /// The background service opens Settings on that launch, so the app does not look closed after an
+    /// installation or update when no headphones are connected and its menu-bar icon is hidden.
+    func consumeFirstLaunch(ofBuild build: String?) -> Bool {
+        guard let build, !build.isEmpty, defaults.string(forKey: Keys.lastLaunchedBuild) != build else { return false }
+        defaults.set(build, forKey: Keys.lastLaunchedBuild)
+        return true
+    }
+
     func setAppLanguage(_ language: AppLanguage) {
         appLanguage = language
         if language == .system {
@@ -291,6 +301,7 @@ final class SettingsStore: ObservableObject {
         #endif
         static let reconnectAutomatically = "preferences.reconnectAutomatically"
         static let launchAtLoginDefaultApplied = "preferences.launchAtLoginDefaultApplied"
+        static let lastLaunchedBuild = "lifecycle.lastLaunchedBuild"
         static let globalShortcutEnabled = "preferences.globalShortcutEnabled"
         static let customEqualizerDraft = "preferences.customEqualizerDraft"
         static let equalizerDraftsByDevice = "preferences.equalizerDraftsByDevice"

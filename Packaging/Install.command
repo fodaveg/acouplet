@@ -536,12 +536,25 @@ if [[ "$verify_local_update" == true ]]; then
     } > "$receipt"
     print -r -- "Install receipt: $receipt"
 fi
+agent_pid=""
 if [[ "$service_should_start" == true ]]; then
-    print "Acouplet is installed and running in the background."
+    # Report the service only if it is still running now, and start it once more if it has quit.
+    for attempt in {1..20}; do
+        agent_pid="$(/bin/launchctl print "$domain/$label" 2>/dev/null | /usr/bin/awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)"
+        [[ -z "$agent_pid" ]] || break
+        if (( attempt == 1 )); then /bin/launchctl kickstart "$domain/$label" >/dev/null 2>&1 || true; fi
+        sleep 0.25
+    done
+    if [[ -z "$agent_pid" ]]; then
+        print -u2 "Acouplet is installed, but its background service is not running. Open Acouplet from Applications to start it."
+        exit 1
+    fi
+    print "Acouplet is installed and running in the background (process $agent_pid)."
+    print "It opens its settings the first time a new version runs. After that, its menu-bar icon appears when a supported Sony device is connected."
 else
     print "Acouplet is updated. Its previously stopped background service remains stopped."
+    print "Its menu-bar icon appears when a supported Sony device is connected."
 fi
-print "Its menu-bar icon appears when a supported Sony device is connected."
 print "Background access is managed in System Settings > General > Login Items & Extensions."
 if [[ -f "$installed_app/Contents/Resources/Acouplet LDAC Output.pkg" ]]; then
     print "Enable LDAC in the app to authorize its bundled driver installation."
