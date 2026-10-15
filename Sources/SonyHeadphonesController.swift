@@ -391,11 +391,21 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             && [playback.statusQueryPayload, playback.musicVolumeQueryPayload]
                 .allSatisfy { playbackReads[$0] == nil && !queuedPlaybackQueries.contains($0) }
     }
-    /// EXPERIMENTAL: true while only the "keep current audio source" flag is being written. It leaves the
-    /// selected source untouched, but any unfinished source transition makes `hasCurrentMusicVolumeControl` false.
-    var isChangingSourceKeepingOnly: Bool {
-        guard let transition = sourceTransition else { return false }
-        return transition.requestedKeeping != nil && !transition.isFinished
+    /// Names the unfinished connection, source, device-action or multipoint transition, if any. While one runs,
+    /// `hasCurrentMusicVolumeControl` is false even when the selected source ends up unchanged, so LDAC holds its
+    /// binding and decides with the final values instead of recovering.
+    var pendingControlTransition: String? {
+        if connectionTransition?.isFinished == false { return "connection" }
+        if sourceTransition?.isFinished == false { return sourceTransition?.requestedKeeping != nil ? "source-keeping" : "source" }
+        if deviceActionTransition?.isFinished == false { return "device-action" }
+        if multipointTransition?.isFinished == false { return "multipoint" }
+        return nil
+    }
+    /// True when a connection-mode change is leaving Sound Quality, or has left it, which LDAC requires.
+    var isLeavingLDACConnectionMode: Bool {
+        guard supportsConnectionMode else { return false }
+        if let transition = connectionTransition, !transition.isFinished { return transition.targetMode != .soundQuality }
+        return connectionMode.map { $0 != .soundQuality } ?? false
     }
     func hasCurrentMusicSourceContext(for localAddress: @autoclosure () -> String?) -> Bool {
         guard hasCurrentTable2Capabilities else { return false }

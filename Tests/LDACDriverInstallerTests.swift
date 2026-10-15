@@ -399,119 +399,108 @@ final class LDACConnectionPreferenceTests: XCTestCase {
 
 @MainActor
 final class LDACRecoveryTests: XCTestCase {
-    func testRecoveryStopsAfterTwoAttemptsAndKeepsLDACEnabled() async throws {
+    private let abort = LDACNativeSession.Completion(message: nil, canRetry: true, requiresAttention: false,
+                                                     targetDisconnected: true, waitForReconnect: false)
+    private let restored = LDACNativeSession.Completion(message: nil, canRetry: false, requiresAttention: true,
+                                                        targetDisconnected: false, waitForReconnect: false)
+
+    func testRecoverableAbortRestoresOrdinaryAudioBeforeTheSingleRetry() async throws {
         let (ldac, headphones) = try preparedRecovery()
         defer { headphones.simulateControlLoss() }
 
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
-        for _ in 0..<20 { await Task.yield() }
+        ldac.simulateSessionFinished(abort)
+        XCTAssertEqual(ldac.simulatedLaunches?.map { $0.restoringOnly }, [true],
+                       "A recoverable abort left the headphones disconnected instead of restoring ordinary audio")
+        XCTAssertEqual(ldac.simulatedRecoveryAttempt, 1)
+        XCTAssertFalse(ldac.isAwaitingAutomaticRetry, "The retry was scheduled before ordinary audio returned")
 
+        ldac.simulateSessionFinished(restored)
+        for _ in 0..<20 { await Task.yield() }
         XCTAssertEqual(ldac.state, .waitingForDevice)
-        XCTAssertEqual(ldac.targetAddress, headphones.address)
+        XCTAssertTrue(ldac.isAwaitingAutomaticRetry)
         XCTAssertEqual(ldac.simulatedRequestedAddress, headphones.address)
         XCTAssertFalse(ldac.isSessionRunning)
-        XCTAssertFalse(ldac.isRecovering)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
 
-        for _ in 0..<10 {
-            headphones.simulateProtocolMessage([0x23, 0x09, 78, 0, 82, 0])
-            await Task.yield()
-            XCTAssertEqual(ldac.state, .waitingForDevice)
-            XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-        }
-    }
-
-    func testFreshControlConnectionDoesNotRenewAnExhaustedRecoveryBudget() async throws {
-        let (ldac, headphones) = try preparedRecovery(isClassicConnected: { _ in true })
-        defer { headphones.simulateControlLoss() }
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
+        try await Task.sleep(for: .milliseconds(100))
         for _ in 0..<20 { await Task.yield() }
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-
-        headphones.simulateControlLoss(deviceConnected: false)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-        headphones.simulateDeviceConnection(named: "WF-1000XM5", simulatedAddress: headphones.address, galleryModel: .wfXM5)
-
-        XCTAssertTrue(headphones.isReady)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
+        XCTAssertFalse(ldac.isAwaitingAutomaticRetry, "The retry delay did not end")
         XCTAssertEqual(ldac.simulatedRequestedAddress, headphones.address)
     }
 
-    func testDeviceDisconnectAndReconnectAllowsRecoveryAfterTheBudgetIsExhausted() async throws {
+    func testAbortOfTheRetryKeepsOrdinaryAudioAndTellsTheUser() async throws {
         let (ldac, headphones) = try preparedRecovery()
         defer { headphones.simulateControlLoss() }
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
+        ldac.simulateSessionFinished(abort)
+        ldac.simulateSessionFinished(restored)
+        for _ in 0..<20 { await Task.yield() }
+        ldac.simulateRecoverySession(headphones)
+
+        ldac.simulateSessionFinished(abort)
+        XCTAssertEqual(ldac.simulatedLaunches?.map { $0.restoringOnly }, [true, true],
+                       "The second abort did not restore ordinary audio")
+        XCTAssertNil(ldac.simulatedRequestedAddress, "A second abort retried LDAC again")
+        ldac.simulateSessionFinished(restored)
         for _ in 0..<20 { await Task.yield() }
 
-        headphones.simulateControlLoss(deviceConnected: false)
+        guard case let .failed(message) = ldac.state else { return XCTFail("No notice after the retry failed: \(ldac.state)") }
+        XCTAssertTrue(message.contains("ordinary Bluetooth audio"), message)
+        XCTAssertFalse(ldac.isAwaitingAutomaticRetry)
+        XCTAssertFalse(ldac.isSessionRunning)
+    }
+
+    func testAbortWithoutDisconnectingReleasesTheOutputWithoutTheRestoreHelper() async throws {
+        let (ldac, headphones) = try preparedRecovery()
+        defer { headphones.simulateControlLoss() }
+
+        ldac.simulateSessionFinished(.init(message: nil, canRetry: true, requiresAttention: false,
+                                           targetDisconnected: false, waitForReconnect: false))
         for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(ldac.simulatedLaunches?.count, 0, "Ordinary audio was still connected, yet the restore helper ran")
         XCTAssertEqual(ldac.state, .waitingForDevice)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-
-        headphones.simulateDeviceConnection(named: "WF-1000XM5", simulatedAddress: headphones.address, galleryModel: .wfXM5)
-
-        XCTAssertTrue(ldac.simulatedCanResumeRecovery(with: headphones))
-        XCTAssertEqual(ldac.simulatedRequestedAddress, headphones.address)
+        XCTAssertTrue(ldac.isAwaitingAutomaticRetry)
     }
 
-    func testCleanupReconnectOnlyEstablishesThePausedDeviceBaseline() async throws {
-        let (ldac, headphones) = try preparedRecovery()
-        defer { headphones.simulateControlLoss() }
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        headphones.simulateControlLoss(deviceConnected: false)
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
-        for _ in 0..<20 { await Task.yield() }
-
-        headphones.simulateDeviceConnection(named: "WF-1000XM5", simulatedAddress: headphones.address, galleryModel: .wfXM5)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-        headphones.simulateControlLoss(deviceConnected: false)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-        headphones.simulateDeviceConnection(named: "WF-1000XM5", simulatedAddress: headphones.address, galleryModel: .wfXM5)
-        XCTAssertTrue(ldac.simulatedCanResumeRecovery(with: headphones))
-    }
-
-    func testRecoveryDoesNotTreatItsCleanupConnectionAsANewResumeEvent() async throws {
-        let (ldac, headphones) = try preparedRecovery()
-        defer { headphones.simulateControlLoss() }
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
-        headphones.simulateDeviceConnection(named: "WF-1000XM5", simulatedAddress: headphones.address, galleryModel: .wfXM5)
-        for _ in 0..<20 { await Task.yield() }
-
-        XCTAssertEqual(ldac.state, .waitingForDevice)
-        XCTAssertFalse(ldac.simulatedCanResumeRecovery(with: headphones))
-    }
-
-    func testShortActivePeriodDoesNotResetRecoveryBudget() async throws {
+    func testShortActivePeriodDoesNotRenewTheRetry() async throws {
         let (ldac, headphones) = try preparedRecovery()
         defer { headphones.simulateControlLoss() }
         let start = Date(timeIntervalSince1970: 1_000)
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout(at: start))
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout(at: start))
-
-        XCTAssertNil(ldac.simulateRecoveryTimeout(stableSince: start, at: start.addingTimeInterval(29.9)))
+        ldac.simulateSessionFinished(abort, at: start)
+        ldac.simulateSessionFinished(restored)
         for _ in 0..<20 { await Task.yield() }
-        XCTAssertEqual(ldac.state, .waitingForDevice)
+        ldac.simulateRecoverySession(headphones)
+
+        ldac.simulateSessionFinished(abort, stableSince: start, at: start.addingTimeInterval(29.9))
+        XCTAssertNil(ldac.simulatedRequestedAddress)
     }
 
-    func testThirtySecondsOfStablePlaybackRenewsRecoveryBudget() throws {
+    func testThirtySecondsOfStablePlaybackRenewsTheRetry() async throws {
         let (ldac, headphones) = try preparedRecovery()
         defer { headphones.simulateControlLoss() }
         let start = Date(timeIntervalSince1970: 1_000)
-        let firstDelay = try XCTUnwrap(ldac.simulateRecoveryTimeout(at: start))
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout(at: start))
+        ldac.simulateSessionFinished(abort, at: start)
+        ldac.simulateSessionFinished(restored)
+        for _ in 0..<20 { await Task.yield() }
+        ldac.simulateRecoverySession(headphones)
 
-        XCTAssertEqual(ldac.simulateRecoveryTimeout(stableSince: start, at: start.addingTimeInterval(30)), firstDelay)
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout(at: start.addingTimeInterval(31)))
+        ldac.simulateSessionFinished(abort, stableSince: start, at: start.addingTimeInterval(30))
         XCTAssertEqual(ldac.simulatedRequestedAddress, headphones.address)
+        XCTAssertEqual(ldac.simulatedRecoveryAttempt, 1)
+    }
+
+    func testExplicitStopCancelsThePendingRetry() async throws {
+        let (ldac, headphones) = try preparedRecovery()
+        defer { headphones.simulateControlLoss() }
+        ldac.simulateSessionFinished(abort)
+        ldac.simulateSessionFinished(restored)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(ldac.isAwaitingAutomaticRetry)
+
+        ldac.stop()
+
+        XCTAssertEqual(ldac.state, .off)
+        XCTAssertNil(ldac.simulatedRequestedAddress)
+        XCTAssertFalse(ldac.isAwaitingAutomaticRetry)
     }
 
     func testPhoneSourceSuspensionRestoresOrdinaryAudioWhileSleepDoesNot() async throws {
@@ -533,10 +522,9 @@ final class LDACRecoveryTests: XCTestCase {
     func testExplicitStopCancelsRememberedRecoveryIntent() async throws {
         let (ldac, headphones) = try preparedRecovery()
         defer { headphones.simulateControlLoss() }
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNotNil(ldac.simulateRecoveryTimeout())
-        XCTAssertNil(ldac.simulateRecoveryTimeout())
+        ldac.suspend(restoreAudio: true, reason: "another headphone music source is active")
         for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(ldac.state, .waitingForDevice)
 
         ldac.stop()
 
@@ -558,6 +546,7 @@ final class LDACRecoveryTests: XCTestCase {
         let headphones = try XCTUnwrap(coordinator.controller(for: address))
         let ldac = LDACController(devices: coordinator, inspectDriver: { _ in .current },
                                   isClassicConnected: isClassicConnected ?? { _ in headphones.isDeviceConnected })
+        ldac.simulateHelpers()
         ldac.simulateRecoverySession(headphones)
         return (ldac, headphones)
     }

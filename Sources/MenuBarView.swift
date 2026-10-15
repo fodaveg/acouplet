@@ -242,7 +242,8 @@ struct MenuBarView: View {
     private var ldacStatusText: String {
         switch ldacState {
         case .off: String(localized: "Off")
-        case .waitingForDevice: String(localized: "Waiting for headphones…")
+        case .waitingForDevice:
+            ldac.isAwaitingAutomaticRetry ? String(localized: "Ordinary audio · retrying LDAC…") : String(localized: "Waiting for headphones…")
         case .requested: ldac.audioCaptureAccess == .checking ? String(localized: "Checking permission…") : String(localized: "Requested…")
         case .connecting: ldac.isRecovering ? String(localized: "Reconnecting…") : String(localized: "Connecting…")
         case .active(let format):

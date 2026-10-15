@@ -535,7 +535,7 @@ final class LDACNativeSession: @unchecked Sendable {
                let values = LDACChannelGate.captures("^AFTER callback=1 status=0x([0-9A-Fa-f]{8}) connected=0$", line),
                let status = UInt32(values[0], radix: 16), status != 0 {
                 connectorSettled = true
-                connectionLost("The headphones are still unavailable. LDAC will reconnect when they return.")
+                connectionLost("The headphones are still unavailable.")
             }
             if line.hasPrefix("CONNECT_CANCELLATION_UNCONFIRMED ") || line.hasPrefix("CONNECT_TERMINAL_UNCONFIRMED ") {
                 connectorSettlementUnverified = true
@@ -638,7 +638,7 @@ final class LDACNativeSession: @unchecked Sendable {
                       let applied = Double(values[0]), applied.isFinite, (0...1).contains(applied) {
                 emit(.gainApplied(applied))
             } else if line.hasPrefix("DRAIN_LIMIT "), active, !shouldStop {
-                connectionLost("The Bluetooth connection stalled. LDAC will reconnect.")
+                connectionLost("The Bluetooth connection stalled. Ordinary Bluetooth audio is being restored.")
             } else if line.hasPrefix("ENCODER_FAILED ") {
                 fail("Live LDAC transmission ended with an error.")
             } else if line.hasPrefix("FEED_COMPLETE ") {
@@ -655,7 +655,7 @@ final class LDACNativeSession: @unchecked Sendable {
                 waitingMediaTransportClosed = true
             } else if line.hasPrefix("PCM_FAILED ") {
                 if line.hasPrefix("PCM_FAILED reason=persistent-degradation ") {
-                    if !shouldStop { connectionLost(String(localized: "The Bluetooth connection couldn’t keep up. LDAC will reconnect.")) }
+                    if !shouldStop { connectionLost(String(localized: "The Bluetooth connection couldn’t keep up. Ordinary Bluetooth audio is being restored.")) }
                     else if !recoverableFailure { failForUser(String(localized: "LDAC stopped because the Bluetooth connection couldn’t keep up.")) }
                 } else {
                     fail(line)
