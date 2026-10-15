@@ -67,6 +67,8 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var backgroundServiceStatus: SMAppService.Status = .notRegistered
     @Published var backgroundServiceMigrationError: String?
     var retryBackgroundServiceMigration: (() -> Void)?
+    /// Quits and reopens the app, set by the app delegate. The language change needs it.
+    var restartApp: (() -> Void)?
     /// Whether the app is installed with its LaunchAgent, read from the plist's real state rather than from
     /// how this copy was started (decision D9). Settings then shows the service instead of Launch at login.
     var hasBackgroundService: Bool {

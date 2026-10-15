@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var backgroundServiceMigrationError: String?
     private var retriesBackgroundServiceMigration = false
     private var isSystemTerminating = false
+    private var restartsAfterTermination = false
 
     /// Asks the running copy whose process ID is the notification's object to open Settings.
     static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
@@ -126,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         environment.settings.retryBackgroundServiceMigration = { [weak self] in
             guard let self, self.backgroundServiceMigrationError != nil else { return }
             self.retriesBackgroundServiceMigration = true
+            NSApp.terminate(nil)
+        }
+        environment.settings.restartApp = { [weak self] in
+            self?.restartsAfterTermination = true
             NSApp.terminate(nil)
         }
         menuBarController = MenuBarController(
@@ -248,6 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: String(localized: "Cancel"))
             guard alert.runModal() == .alertFirstButtonReturn else {
                 isSystemTerminating = false
+                restartsAfterTermination = false
                 return .terminateCancel
             }
             retriesBackgroundServiceMigration = true
@@ -310,6 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.environment.devices.cancelTermination()
                     self?.retriesBackgroundServiceMigration = false
                     self?.isSystemTerminating = false
+                    self?.restartsAfterTermination = false
                 }
                 sender.reply(toApplicationShouldTerminate: interrupted == nil && (self?.finishTermination() ?? .terminateNow) == .terminateNow)
             }
@@ -339,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 environment.settings.selectedSettingsPane = "general"
                 showSettings()
                 isSystemTerminating = false
+                restartsAfterTermination = false
                 return .terminateCancel
             }
         }
@@ -359,6 +367,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         environment.noiseModeHUD.dismiss()
         #endif
         environment.devices.stop()
+        if restartsAfterTermination { relaunch() }
+    }
+
+    /// Opens the app again after this copy has finished terminating (G8).
+    ///
+    /// The background service exits with a failure status, which its KeepAlive (`SuccessfulExit = false`)
+    /// turns into a relaunch by launchd. A copy of its own asks `open` to start a new copy once this
+    /// process has exited, so the new one does not find this one still running and defer to it.
+    private func relaunch() {
+        if environment.settings.isBackgroundServiceProcess { exit(EX_TEMPFAIL) }
+        let reopen = Process()
+        reopen.executableURL = URL(fileURLWithPath: "/bin/sh")
+        reopen.arguments = ["-c", "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open -n \"$2\"",
+                            "acouplet-relaunch", String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+        do {
+            try reopen.run()
+        } catch {
+            NSLog("Acouplet could not schedule its relaunch: %@", error.localizedDescription)
+        }
     }
 
     private func observeDeviceAlerts(_ controllers: [SonyHeadphonesController]) {

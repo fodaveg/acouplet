@@ -16756,23 +16756,6 @@
         }
       }
     },
-    "Quit and reopen Acouplet to apply the language change.": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Quit and reopen Acouplet to apply the language change."
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Dil değişikliğini uygulamak için Acouplet’i kapatıp yeniden açın."
-          }
-        }
-      }
-    },
     "Use system accent color": {
       "extractionState": "manual",
       "localizations": {
@@ -16786,6 +16769,40 @@
           "stringUnit": {
             "state": "translated",
             "value": "Sistem vurgu rengini kullan"
+          }
+        }
+      }
+    },
+    "Restart Acouplet to apply the language change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Acouplet to apply the language change."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dil değişikliğini uygulamak için Acouplet’i yeniden başlatın."
+          }
+        }
+      }
+    },
+    "Restart Acouplet": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Acouplet"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acouplet’i Yeniden Başlat"
           }
         }
       }

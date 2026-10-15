@@ -115,10 +115,13 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("settings.appLanguage")
                 if settings.appLanguageNeedsRestart {
-                    Text("Quit and reopen Acouplet to apply the language change.")
+                    Text("Restart Acouplet to apply the language change.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("settings.appLanguageRestart")
+                    Button("Restart Acouplet") { settings.restartApp?() }
+                        .disabled(settings.restartApp == nil)
+                        .accessibilityIdentifier("settings.appLanguageRestartButton")
                 }
                 Toggle("Use system accent color", isOn: $settings.useSystemAccentColor)
                     .accessibilityIdentifier("settings.systemAccent")
