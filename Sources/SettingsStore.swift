@@ -131,9 +131,9 @@ final class SettingsStore: ObservableObject {
             : defaults.bool(forKey: Keys.reconnectAutomatically)
         // Filled in by refreshLaunchStatus() below, off the main thread.
         launchAtLogin = false
-        globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) == nil
-            ? true
-            : defaults.bool(forKey: Keys.globalShortcutEnabled)
+        // Off unless turned on (decision D12): ⌥⌘A is exclusive system-wide. The value is stored only when
+        // someone flips the toggle, so a stored true is a deliberate choice and is kept.
+        globalShortcutEnabled = defaults.bool(forKey: Keys.globalShortcutEnabled)
         customEqualizerDraft = Self.decode(EqualizerSettings.self, from: defaults.data(forKey: Keys.customEqualizerDraft)) ?? .flat
         equalizerDraftsByDevice = Self.decode([String: EqualizerSettings].self, from: defaults.data(forKey: Keys.equalizerDraftsByDevice)) ?? [:]
         equalizerProfiles = Self.decode([SavedEqualizerProfile].self, from: defaults.data(forKey: Keys.equalizerProfiles)) ?? []

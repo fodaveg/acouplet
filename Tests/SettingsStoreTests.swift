@@ -551,8 +551,11 @@ final class SettingsStoreTests: XCTestCase {
         settings.showBatteryInMenuBar = true
         XCTAssertTrue(SettingsStore(defaults: defaults).showBatteryInMenuBar)
         XCTAssertTrue(settings.reconnectAutomatically)
-        XCTAssertTrue(settings.globalShortcutEnabled)
+        XCTAssertFalse(settings.globalShortcutEnabled, "The system-wide shortcut stays off until someone turns it on")
+        XCTAssertNil(defaults.object(forKey: "preferences.globalShortcutEnabled"))
         XCTAssertEqual(settings.customEqualizerDraft, .flat)
+        settings.globalShortcutEnabled = true
+        XCTAssertTrue(SettingsStore(defaults: defaults).globalShortcutEnabled, "A shortcut turned on deliberately stays on")
 
         settings.reconnectAutomatically = false
         settings.globalShortcutEnabled = false
