@@ -61,8 +61,9 @@ final class SonyNotificationService: ObservableObject {
 
     func updateLowBattery(deviceID: String, name: String, readings: [SonyLowBatteryPolicy.Reading],
                           isCurrent: () -> Bool = { true }, at date: Date = Date()) async {
+        let previous = policy
         let warnings = policy.warnings(for: deviceID, readings: readings, at: date)
-        persistPolicy()
+        if policy != previous { persistPolicy() }
         guard settings.lowBatteryNotificationsEnabled, let warning = warnings.first,
               !Task.isCancelled, warning.reading.isFresh(at: Date()), isCurrent() else { return }
         if presentLowBattery(warning, name) {
