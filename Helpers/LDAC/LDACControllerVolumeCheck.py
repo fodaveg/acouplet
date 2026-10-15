@@ -283,7 +283,7 @@ final class Controller: ObservableObject {
     var outputID: UUID?
     var headphones: SonyHeadphonesController?
     let bundle = Bundle.main
-    let inspectDriver: (Bundle) -> LDACDriverInstaller.State = { LDACDriverInstaller.inspect(bundle: $0) }
+    let inspectDriver: ((Bundle) -> LDACDriverInstaller.State)? = { LDACDriverInstaller.inspect(bundle: $0) }
     var isClassicConnected: (String) -> Bool = { _ in true }
     var driverState = LDACDriverInstaller.State.current
     var audioRoute: MacAudioRouteObserver? = MacAudioRouteObserver()
