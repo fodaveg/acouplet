@@ -382,17 +382,45 @@ enum LegacyBackgroundService {
     }
 
     #if !DEBUG
-    static func prepare(defaults: UserDefaults = .standard) throws {
+    /// Returns true when this process is the LaunchAgent's copy and its job still runs the old policy, so
+    /// `prepare` has to migrate it. Once the job runs the new policy, this clears the record of the attempt.
+    static func needsMigration(defaults: UserDefaults = .standard) -> Bool {
         let environment = ProcessInfo.processInfo.environment
         guard Bundle.main.bundleIdentifier == "dev.baglayan.Acouplet",
               Bundle.main.executableURL?.path == executablePath,
               CommandLine.arguments.contains("--background-service"),
-              environment["XPC_SERVICE_NAME"] == label || CommandLine.arguments.contains("--service-migration-recovery") else { return }
-        let recovering = CommandLine.arguments.contains("--service-migration-recovery")
-        if !recovering, environment[policyKey] == policy {
+              environment["XPC_SERVICE_NAME"] == label || CommandLine.arguments.contains("--service-migration-recovery") else { return false }
+        if !CommandLine.arguments.contains("--service-migration-recovery"), environment[policyKey] == policy {
             defaults.removeObject(forKey: attemptKey)
-            return
+            return false
         }
+        return true
+    }
+
+    /// Runs `prepare` on a background queue and calls `completion` on the main actor with its error, so the
+    /// main thread does not wait on launchd (G10). Returns false, and never calls `completion`, when there is
+    /// nothing to migrate. A successful startup migration does not return: launchd replaces this process.
+    static func prepareInBackground(defaults: UserDefaults = .standard,
+                                    completion: @escaping @MainActor @Sendable ((any Error)?) -> Void) -> Bool {
+        guard needsMigration(defaults: defaults) else { return false }
+        // UserDefaults is thread-safe, though the SDK does not mark it Sendable.
+        nonisolated(unsafe) let defaults = defaults
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: (any Error)?
+            do {
+                try prepare(defaults: defaults)
+                result = nil
+            } catch {
+                result = error
+            }
+            Task { @MainActor in completion(result) }
+        }
+        return true
+    }
+
+    static func prepare(defaults: UserDefaults = .standard) throws {
+        guard needsMigration(defaults: defaults) else { return }
+        let recovering = CommandLine.arguments.contains("--service-migration-recovery")
         guard !defaults.bool(forKey: attemptKey) else { throw failure(2) }
         let contents = try configuration(from: ownedPlistData(), executablePath: executablePath)
         let data = try PropertyListSerialization.data(fromPropertyList: contents, format: .xml, options: 0)

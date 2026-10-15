@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var retriesBackgroundServiceMigration = false
     private var isSystemTerminating = false
     private var restartsAfterTermination = false
+    private var isMigratingBackgroundService = false
+    private var deferredLaunch: (notification: Notification, launchType: OSType?)?
 
     /// Asks the running copy whose process ID is the notification's object to open Settings.
     static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
@@ -39,24 +41,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         super.init()
         #if !DEBUG && !ACOUPLET_PUBLIC_APIS_ONLY
-        if CommandLine.arguments.contains("--migrate-background-service") {
-            NSApplication.shared.setActivationPolicy(.prohibited)
-            do {
-                try LegacyBackgroundService.runMigration()
-            } catch {
-                NSLog("Background service migration failed: %@", error.localizedDescription)
-                exit(EXIT_FAILURE)
-            }
-            exit(EXIT_SUCCESS)
-        }
         if CommandLine.arguments.contains("--service-migration-recovery") {
             backgroundServiceMigrationError = Self.backgroundServiceMigrationMessage
         } else {
-            do {
-                try LegacyBackgroundService.prepare()
-            } catch {
-                NSLog("Background service migration failed: %@", error.localizedDescription)
-                backgroundServiceMigrationError = Self.backgroundServiceMigrationMessage
+            // The migration waits up to 15 s for launchd, off the main thread (G10). Launching finishes once it
+            // has failed; when it succeeds, launchd replaces this process first.
+            isMigratingBackgroundService = LegacyBackgroundService.prepareInBackground { [weak self] error in
+                self?.backgroundServiceMigrationDidFinish(error)
             }
         }
         #endif
@@ -112,7 +103,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
     }
 
-    private var isRunningTests: Bool {
+    private var isRunningTests: Bool { Self.isRunningTests }
+
+    static var isRunningTests: Bool {
         #if DEBUG
         ProcessInfo.processInfo.environment["ACOUPLET_TESTING"] == "1" ||
             ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
@@ -125,6 +118,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !isDuplicateLaunch else { return }
+        let launchType = NSAppleEventManager.shared().currentAppleEvent?
+            .paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue
+        // While the LaunchAgent's copy migrates its job, it neither starts the headphones nor counts the first
+        // launch of the build: if the migration succeeds, launchd stops this process and starts the new one.
+        guard !isMigratingBackgroundService else {
+            deferredLaunch = (notification, launchType)
+            return
+        }
+        finishLaunching(notification, launchType: launchType)
+    }
+
+    private func finishLaunching(_ notification: Notification, launchType: OSType?) {
         environment.settings.backgroundServiceMigrationError = backgroundServiceMigrationError
         environment.settings.retryBackgroundServiceMigration = { [weak self] in
             guard let self, self.backgroundServiceMigrationError != nil else { return }
@@ -172,8 +177,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             uiTestWindow = window
         }
         #endif
-        let launchType = NSAppleEventManager.shared().currentAppleEvent?
-            .paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue
         let isDefaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool == true
         let isFirstLaunchOfBuild = !isRunningTests && environment.settings.consumeFirstLaunch(
             ofBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
@@ -355,6 +358,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     #if !DEBUG && !ACOUPLET_PUBLIC_APIS_ONLY
     private static var backgroundServiceMigrationMessage: String {
         String(localized: "Acouplet couldn’t update its startup settings. Try again.")
+    }
+
+    /// Records the result of the startup migration and finishes the launch that waited for it.
+    private func backgroundServiceMigrationDidFinish(_ error: (any Error)?) {
+        if let error {
+            NSLog("Background service migration failed: %@", error.localizedDescription)
+            backgroundServiceMigrationError = Self.backgroundServiceMigrationMessage
+        }
+        isMigratingBackgroundService = false
+        guard let launch = deferredLaunch else { return }
+        deferredLaunch = nil
+        finishLaunching(launch.notification, launchType: launch.launchType)
     }
     #endif
 

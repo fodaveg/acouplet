@@ -5,9 +5,13 @@ repo = Path(__file__).resolve().parent.parent
 source = (repo / 'Sources/SettingsStore.swift').read_text()
 implementation = source[source.index('enum LegacyBackgroundService {'):].removesuffix('#endif\n')
 delegate = (repo / 'Sources/AppDelegate.swift').read_text()
-helper_entry = delegate.split('        if CommandLine.arguments.contains("--migrate-background-service") {', 1)[1].split('        if CommandLine.arguments.contains("--service-migration-recovery") {', 1)[0]
+entry = (repo / 'Sources/AppMain.swift').read_text()
+# The helper runs from AcoupletMain.main(), before NSApplication and the app environment exist (G10).
+helper_entry = entry.split('        if CommandLine.arguments.contains("--migrate-background-service") {', 1)[1].split('        if handOffPlainLaunchToService() {', 1)[0]
 helper_entry = 'if CommandLine.arguments.contains("--migrate-background-service") {' + helper_entry
-helper_entry = helper_entry.replace('            NSApplication.shared.setActivationPolicy(.prohibited)\n', '')
+assert 'NSApplication' not in helper_entry and 'environment' not in helper_entry
+# The startup migration must not wait on the main thread (G10): AppDelegate.init hands it to prepareInBackground.
+assert 'LegacyBackgroundService.prepareInBackground' in delegate.split('    override init() {', 1)[1].split('    func applicationWillFinishLaunching', 1)[0]
 quit_observation = delegate.split('        if [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut]', 1)[1].split('        } else if backgroundServiceMigrationError', 1)[0]
 quit_observation = 'if [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut]' + quit_observation + '        }'
 quit_cancellation = delegate.split('                if interrupted != nil {', 1)[1].split('                }', 1)[0].replace('self?.', '')
@@ -88,10 +92,20 @@ struct TerminationCheck {
 }
 '''
     swift.write_text('import Foundation\nimport AppKit\n' + fixture_implementation + termination_check + r'''
+final class MigrationOutcome: @unchecked Sendable {
+    var isFinished = false
+    var error: (any Error)?
+}
+
 final class FixtureDefaults: UserDefaults, @unchecked Sendable {
     private var values: [String: Any] = [:]
+    /// Whether prepare recorded its attempt from the main thread, which would mean it waited there too.
+    var recordedOnMainThread = false
     override func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
-    override func set(_ value: Any?, forKey key: String) { values[key] = value }
+    override func set(_ value: Any?, forKey key: String) {
+        if Thread.isMainThread { recordedOnMainThread = true }
+        values[key] = value
+    }
     override func removeObject(forKey key: String) { values.removeValue(forKey: key) }
 }
 
@@ -109,7 +123,25 @@ struct MigrationCheck {
                 _ = try retry.read(upToCount: 1)
                 defaults.removeObject(forKey: LegacyBackgroundService.attemptKey)
             }
-            try LegacyBackgroundService.prepare(defaults: defaults)
+            // The fixture runs the delegate's path: the migration on a background queue, its result on the main
+            // actor, and the main run loop free meanwhile (G10).
+            let outcome = MigrationOutcome()
+            // A timer keeps the main run loop running while it waits for the result.
+            let heartbeat = Timer(timeInterval: 0.05, repeats: true) { _ in }
+            RunLoop.main.add(heartbeat, forMode: .default)
+            let migrating = LegacyBackgroundService.prepareInBackground(defaults: defaults) { error in
+                precondition(Thread.isMainThread, "The migration result arrived off the main thread")
+                outcome.error = error
+                outcome.isFinished = true
+            }
+            precondition(!outcome.isFinished, "The migration finished on the calling thread")
+            precondition(migrating || !recovering, "A recovery launch skipped its migration")
+            while migrating && !outcome.isFinished {
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            }
+            heartbeat.invalidate()
+            precondition(!defaults.recordedOnMainThread, "The migration ran on the main thread")
+            if let error = outcome.error { throw error }
             if recovering {
                 try Data("ready".utf8).write(to: directory.appending(path: "recovery-parent-ready"))
                 return

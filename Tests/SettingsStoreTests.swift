@@ -359,6 +359,52 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDuplicateLaunchDefersBeforeBuildingTheEnvironment() {
+        typealias Copy = AcoupletMain.RunningCopy
+        var reopened: [pid_t] = []
+        var waits = 0
+        func defers(service: Bool = false, _ states: [[Copy]], waitLimit: Int = 50) -> Bool {
+            reopened = []
+            waits = 0
+            var index = 0
+            return AcoupletMain.defersToRunningCopy(
+                isBackgroundService: service,
+                runningCopies: {
+                    defer { index = min(index + 1, states.count - 1) }
+                    return states[index]
+                },
+                reopen: { reopened.append($0) },
+                wait: {
+                    waits += 1
+                    return waits < waitLimit
+                })
+        }
+        let launching = Copy(processIdentifier: 41, isFinishedLaunching: false, isTerminated: false)
+        let running = Copy(processIdentifier: 41, isFinishedLaunching: true, isTerminated: false)
+        let terminated = Copy(processIdentifier: 41, isFinishedLaunching: true, isTerminated: true)
+
+        XCTAssertFalse(defers([[]]), "The only copy builds its environment")
+        XCTAssertTrue(reopened.isEmpty)
+
+        XCTAssertTrue(defers([[running], [running]]))
+        XCTAssertEqual(reopened, [41], "A plain duplicate asks the running copy to open Settings")
+
+        XCTAssertTrue(defers([[launching], [launching], [launching], [running]]))
+        XCTAssertEqual(reopened, [41], "It waits until the running copy has finished launching")
+        XCTAssertEqual(waits, 2)
+
+        XCTAssertTrue(defers(service: true, [[running]]))
+        XCTAssertTrue(reopened.isEmpty, "The LaunchAgent's copy quits without opening Settings")
+
+        XCTAssertTrue(defers([[launching], [terminated]]))
+        XCTAssertTrue(reopened.isEmpty, "A copy that terminated is not asked to open Settings")
+
+        XCTAssertTrue(defers([[launching], [launching]], waitLimit: 3))
+        XCTAssertTrue(reopened.isEmpty, "Running out of time quits without reopening")
+        XCTAssertEqual(waits, 3)
+    }
+
+    @MainActor
     func testFirstLaunchOfEachBuildIsReportedOnceAcrossRelaunches() throws {
         let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

@@ -19,11 +19,76 @@ enum AcoupletMain {
             exit(status)
         }
         #if !DEBUG && !ACOUPLET_PUBLIC_APIS_ONLY
+        // The helper that launchd starts to reload the LaunchAgent runs here, before NSApplication exists, so it
+        // never registers as a running copy of the app (G10).
+        if CommandLine.arguments.contains("--migrate-background-service") {
+            do {
+                try LegacyBackgroundService.runMigration()
+            } catch {
+                NSLog("Background service migration failed: %@", error.localizedDescription)
+                exit(EXIT_FAILURE)
+            }
+            exit(EXIT_SUCCESS)
+        }
         if handOffPlainLaunchToService() {
             exit(EXIT_SUCCESS)
         }
         #endif
+        if deferToRunningCopy() {
+            exit(EXIT_SUCCESS)
+        }
         AcoupletApp.main()
+    }
+
+    /// A running copy of the app as the launch check sees it.
+    struct RunningCopy: Equatable {
+        let processIdentifier: pid_t
+        let isFinishedLaunching: Bool
+        let isTerminated: Bool
+    }
+
+    /// Returns true when this launch should quit because another copy of the app is already running (G10, with
+    /// G5's rule that only one copy runs).
+    ///
+    /// The check runs before `AcoupletApp.main()`, so a duplicate quits without building the app environment:
+    /// the driver signature checks, `SMAppService`, the HUD probe and Sparkle. The LaunchAgent's copy quits
+    /// straight away. Any other copy waits until the running one has finished launching, asks it to open
+    /// Settings and quits; it also quits if that copy terminates or `wait` reports that time is up.
+    /// `applicationWillFinishLaunching` keeps the same check for two copies that start at the same moment.
+    static func defersToRunningCopy(isBackgroundService: Bool, runningCopies: () -> [RunningCopy],
+                                    reopen: (pid_t) -> Void, wait: () -> Bool) -> Bool {
+        guard let existing = runningCopies().first else { return false }
+        guard !isBackgroundService else { return true }
+        repeat {
+            guard let copy = runningCopies().first(where: { $0.processIdentifier == existing.processIdentifier }),
+                  !copy.isTerminated else { return true }
+            if copy.isFinishedLaunching {
+                reopen(copy.processIdentifier)
+                return true
+            }
+        } while wait()
+        return true
+    }
+
+    private static func deferToRunningCopy() -> Bool {
+        guard !AppDelegate.isRunningTests, let identifier = Bundle.main.bundleIdentifier else { return false }
+        let deadline = Date().addingTimeInterval(5)
+        return defersToRunningCopy(
+            isBackgroundService: CommandLine.arguments.contains("--background-service"),
+            runningCopies: {
+                NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+                    .filter { $0.processIdentifier != getpid() && $0.activationPolicy != .prohibited }
+                    .map { RunningCopy(processIdentifier: $0.processIdentifier, isFinishedLaunching: $0.isFinishedLaunching,
+                                       isTerminated: $0.isTerminated) }
+            },
+            reopen: { identifier in
+                DistributedNotificationCenter.default().postNotificationName(
+                    AppDelegate.reopenNotification, object: String(identifier), userInfo: nil, deliverImmediately: true)
+            },
+            wait: {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                return Date() < deadline
+            })
     }
 
     #if !DEBUG && !ACOUPLET_PUBLIC_APIS_ONLY
