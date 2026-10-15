@@ -376,6 +376,8 @@ enum LegacyBackgroundService {
         environment[policyKey] = policy
         plist["EnvironmentVariables"] = environment
         plist["KeepAlive"] = ["SuccessfulExit": false]
+        // Without a ProcessType launchd clamps the service and its LDAC helpers to the utility QoS.
+        plist["ProcessType"] = "Interactive"
         return plist
     }
 

@@ -142,17 +142,23 @@ static const char *PolicyName(int policy) {
     }
 }
 
-// Prints `SCHED_SAMPLE trigger=<line key> …` with the change since `since` and the calling
-// thread's scheduling state now. `packet` is negative when the trigger has no packet number.
-static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSample since) {
-    SchedulerSample now = TakeSchedulerSample();
+// Time the process spent runnable without running between two samples, or 0 without counters.
+static double SchedulerWaiting(SchedulerSample since, SchedulerSample now) {
+    if (!since.available || !now.available) return 0;
+    return MachSeconds(now.runnable - since.runnable) - MachSeconds(now.cpu - since.cpu);
+}
+
+// Prints `SCHED_SAMPLE trigger=<line key> …` with the change from `since` to `now` and the calling
+// thread's scheduling state. `packet` is negative when the trigger has no packet number.
+static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSample since, SchedulerSample now) {
     thread_t thread = pthread_mach_thread_np(pthread_self());
     thread_extended_info_data_t state = {0};
     mach_msg_type_number_t stateCount = THREAD_EXTENDED_INFO_COUNT;
     BOOL stateRead = thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&state, &stateCount) == KERN_SUCCESS;
     thread_time_constraint_policy_data_t constraint;
     mach_msg_type_number_t constraintCount = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
-    boolean_t constraintDefault = TRUE;
+    // FALSE asks for the thread's current policy; TRUE would always return the defaults.
+    boolean_t constraintDefault = FALSE;
     int realtime = thread_policy_get(thread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&constraint,
         &constraintCount, &constraintDefault) == KERN_SUCCESS ? !constraintDefault : -1;
     qos_class_t qos = QOS_CLASS_UNSPECIFIED;
@@ -165,13 +171,101 @@ static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSamp
            trigger, packetField, now.wall - since.wall, counted,
            counted ? MachSeconds(now.runnable - since.runnable) : -1,
            counted ? MachSeconds(now.cpu - since.cpu) : -1,
-           counted ? MachSeconds(now.runnable - since.runnable) - MachSeconds(now.cpu - since.cpu) : -1,
+           counted ? SchedulerWaiting(since, now) : -1,
            counted ? MachSeconds(now.performanceCPU - since.performanceCPU) : -1,
            counted ? now.contextSwitches - since.contextSwitches : -1,
            counted ? now.interruptWakeups - since.interruptWakeups : 0,
            QoSName(qos), relativePriority, stateRead ? PolicyName(state.pth_policy) : "unread",
            stateRead ? state.pth_curpri : -1, stateRead ? state.pth_priority : -1, stateRead ? state.pth_maxpriority : -1,
            realtime, stateRead ? state.pth_cpu_usage : -1, stateRead ? state.pth_run_state : -1);
+}
+
+// Breach logging limits. A lasting stall repeats a breach on every packet: build 105 at 96 kHz wrote
+// 17 085 PACING_BREACH and 9 743 SCHED_SAMPLE lines in 3.5 min (8.3 MB), from the sender thread
+// itself. Each kind now prints the first breach of a streak and then at most one a second; a streak
+// ends after a second without that breach and closes with one BREACH_STREAK summary line.
+static const double BreachPrintSeconds = 1;
+
+typedef struct {
+    BOOL active;
+    double firstAt;
+    double lastAt;
+    double lastPrintedAt;
+    unsigned long events;
+    unsigned long printed;
+    double maximumLate;
+    double totalLate;
+    double waitingForCPU;
+} BreachStreak;
+
+// Moves a streak that has ended by `now` (or any streak when `force`) into `summary`.
+static BOOL CloseBreachStreak(BreachStreak *streak, double now, BOOL force, BreachStreak *summary) {
+    if (!streak->active || (!force && now - streak->lastAt < BreachPrintSeconds)) return NO;
+    *summary = *streak;
+    *streak = (BreachStreak){0};
+    return YES;
+}
+
+static void PrintBreachStreak(const char *kind, BreachStreak summary) {
+    printf("BREACH_STREAK kind=%s events=%lu printed=%lu seconds=%.6f maxLate=%.6f meanLate=%.6f waitingForCPU=%.6f\n",
+           kind, summary.events, summary.printed, summary.lastAt - summary.firstAt, summary.maximumLate,
+           summary.events ? summary.totalLate / summary.events : 0, summary.waitingForCPU);
+}
+
+// Counts one breach of `kind`, closing the previous streak first if it had ended, and returns
+// whether this breach's lines should be printed.
+static BOOL NoteBreach(BreachStreak *streak, const char *kind, double now, double late, double waitingForCPU) {
+    BreachStreak summary;
+    if (CloseBreachStreak(streak, now, NO, &summary)) PrintBreachStreak(kind, summary);
+    BOOL print = !streak->active || now - streak->lastPrintedAt >= BreachPrintSeconds;
+    if (!streak->active) {
+        streak->active = YES;
+        streak->firstAt = now;
+    }
+    streak->lastAt = now;
+    streak->events++;
+    streak->maximumLate = fmax(streak->maximumLate, late);
+    streak->totalLate += late;
+    streak->waitingForCPU += waitingForCPU;
+    if (print) {
+        streak->printed++;
+        streak->lastPrintedAt = now;
+    }
+    return print;
+}
+
+enum { BreachPCM, BreachPacing, BreachDrain, BreachKindCount };
+static const char *const BreachKinds[BreachKindCount] = {"PCM_BREACH", "PACING_BREACH", "DRAIN_BREACH"};
+
+static void FlushBreachStreaks(BreachStreak *streaks, double now, BOOL force) {
+    for (int kind = 0; kind < BreachKindCount; kind++) {
+        BreachStreak summary;
+        if (CloseBreachStreak(&streaks[kind], now, force, &summary)) PrintBreachStreak(BreachKinds[kind], summary);
+    }
+}
+
+static BOOL BreachStreakChecks(void) {
+    // 375 breaches a second for 3 s print three lines: the first and one each second after.
+    BreachStreak streak = {0};
+    unsigned long printed = 0;
+    for (unsigned int index = 0; index < 1125; index++) printed += NoteBreach(&streak, "CHECK", 10 + index / 375.0, 0.2 + index % 3 * 0.01, 0.001);
+    BOOL passed = printed == 3 && streak.active && streak.events == 1125 && streak.printed == 3;
+    passed &= fabs(streak.maximumLate - 0.22) < 1e-12 && fabs(streak.totalLate / streak.events - 0.21) < 1e-9;
+    passed &= fabs(streak.waitingForCPU - 1.125) < 1e-9;
+    // Still the same streak within a second of the last breach; a later breach starts a new one and prints.
+    BreachStreak summary;
+    passed &= !CloseBreachStreak(&streak, 13.5, NO, &summary) && CloseBreachStreak(&streak, 14.1, NO, &summary);
+    passed &= summary.events == 1125 && summary.printed == 3 && !streak.active;
+    passed &= NoteBreach(&streak, "CHECK", 14.2, 0.15, 0) && !NoteBreach(&streak, "CHECK", 14.3, 0.15, 0);
+    passed &= NoteBreach(&streak, "CHECK", 16, 0.15, 0) && streak.events == 1 && streak.printed == 1;
+    passed &= CloseBreachStreak(&streak, 16, YES, &summary) && summary.events == 1 && !streak.active;
+    BreachStreak streaks[BreachKindCount] = {0};
+    passed &= NoteBreach(&streaks[BreachDrain], BreachKinds[BreachDrain], 20, 0.1, 0);
+    FlushBreachStreaks(streaks, 20.5, NO);
+    passed &= streaks[BreachDrain].active;
+    FlushBreachStreaks(streaks, 20.5, YES);
+    passed &= !streaks[BreachDrain].active;
+    return passed;
 }
 
 // Audit L9: drain and pacing accept any writable space of at least the baseline, so a send buffer
@@ -252,6 +346,25 @@ static const double DegradationLimit = 0.2;
 // A late sender skips PCM only from 200 ms on, below the 250 ms PCM reserve (prefill = rate / 4).
 // Up to there it catches up by sending without pacing.
 static const double PCMSkipLateness = 0.2;
+// Lateness only measures the sender when PCM is waiting in the ring. With the ring empty the source
+// sets the pace: build 105 at 96 kHz (session 08A81711) showed the capture delivering about 440 ppm
+// below the nominal rate, the ring at 512 frames, nothing to skip, and the 250 ms limit ending the
+// stream as a hard error. A continuous stream now moves its schedule to the source instead, and only
+// a source that delivers nothing for a whole second fails, as a recoverable source-stalled.
+static const double PCMSourceStallSeconds = 1;
+
+// How long the sender waits for the PCM block it needs. In a continuous stream the block is due when
+// its last sample should exist (`blockDue`) and the wait ends one stall period after that, or after
+// it began if the source was already behind. Fixed-length probe runs keep the strict 250 ms limit
+// past the packet's due time.
+static double SourceWaitLimit(BOOL continuous, double packetDue, double blockDue, double waitStart) {
+    return continuous ? fmax(blockDue, waitStart) + PCMSourceStallSeconds : packetDue + 0.25;
+}
+
+// How far the schedule moves once a waited-for block arrives: the time past its due, or nothing.
+static double SourceResync(BOOL continuous, double blockDue, double arrived) {
+    return continuous ? fmax(0, arrived - blockDue) : 0;
+}
 
 typedef struct {
     double bucketEnd;
@@ -334,6 +447,27 @@ static BOOL RecoveryChecks(void) {
     degradation = NewDegradation(10, 48000, 0);
     passed &= !RecordDegradation(&degradation, 10.5, second - 8) && !RecordDegradation(&degradation, 1000000.5, second - 8 + skip);
     passed &= DegradationWindowBytes(&degradation) == skip && degradation.bucketEnd > 1000000.5 && degradation.bucketEnd <= 1000001.5;
+    // A continuous stream waits for its source up to one stall period past the block's due time, or
+    // past the start of the wait when the source is already behind; a probe run keeps the 250 ms limit.
+    passed &= SourceWaitLimit(YES, 10, 10.005, 9.9) == 11.005 && SourceWaitLimit(YES, 10, 10.005, 10.3) == 11.3;
+    passed &= SourceWaitLimit(NO, 10, 10.005, 9.9) == 10.25;
+    // A late block moves the schedule by its lateness; an early one, or a probe run, does not.
+    passed &= fabs(SourceResync(YES, 10.005, 10.2) - 0.195) < 1e-12 && SourceResync(YES, 10.005, 10) == 0 &&
+        SourceResync(NO, 10.005, 10.2) == 0;
+    // Build 105, 96 kHz (08A81711): the source ran 200 ms behind, about 180 ppm slow, and a 45 ms
+    // capture hiccup at the end took the fixed schedule past 250 ms, a hard failure. Following the
+    // source, no block comes near the stall limit and the schedule absorbs the whole deficit.
+    double paceStart = 0, fixedLate = 0, worstWait = -INFINITY, previousArrival = 0;
+    for (uint64_t block = 0; block < 45 * 96000 / 128; block++) {
+        double nominal = (double)(block + 1) * 128 / 96000;
+        double arrived = 0.2 + nominal * (1 + 180e-6) + (block >= 44 * 96000 / 128 ? 0.045 : 0);
+        double blockDue = paceStart + nominal;
+        fixedLate = fmax(fixedLate, arrived - nominal);
+        worstWait = fmax(worstWait, arrived - SourceWaitLimit(YES, blockDue, blockDue, previousArrival));
+        paceStart += SourceResync(YES, blockDue, arrived);
+        previousArrival = arrived;
+    }
+    passed &= fixedLate > 0.25 && worstWait < -0.75 && paceStart > 0.25 && paceStart < 0.26;
     return passed;
 }
 
@@ -376,6 +510,112 @@ static BOOL SelectProfile(uint32_t sampleRate, NSString *quality, LDACProfile *p
         ((sampleRate + 127) / 128) * PCMBlockBytes, (sampleRate / 4) * 8, sampleRate / 50,
         [quality isEqualToString:@"auto"]};
     return YES;
+}
+
+// Real-time scheduling for the sender thread. The L3 samples of 15 Oct 2026 showed the helper
+// clamped to priority 20 (the base of the utility QoS, inherited from a LaunchAgent without a
+// ProcessType) and the stalls spent runnable without a CPU. A thread under the time-constraint
+// policy, as Core Audio's IO threads are, is scheduled in the real-time band (97) even under that
+// clamp; only a darwin-background clamp demotes it. The budget follows the packet pacing: the period
+// is one packet, the computation a quarter of it (0.5 to 2 ms, far above the microseconds of work per
+// wake-up, since the loop sleeps every millisecond) and the constraint half of it.
+typedef struct {
+    double period;
+    double computation;
+    double constraint;
+} SenderRealtimeBudget;
+
+static SenderRealtimeBudget SenderRealtimeBudgetFor(LDACProfile profile, int mtu) {
+    // libldac packs (min(MTU, 679) - 18) / frame bytes frames per packet, 2 to 15. Adaptive streams
+    // can rise to the high-quality frame, the shortest packet, so they budget for that one.
+    int frameBytes = profile.adaptive ? 330 : profile.frameBytes;
+    int frames = frameBytes > 0 ? (MIN(mtu, 679) - 18) / frameBytes : 2;
+    frames = MAX(2, MIN(15, frames));
+    double period = (double)frames * profile.frameSamples / profile.sampleRate;
+    double computation = fmin(0.002, fmax(0.0005, period / 4));
+    return (SenderRealtimeBudget){period, computation, fmax(computation, period / 2)};
+}
+
+static uint32_t MachTicks(double seconds) {
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    return (uint32_t)llround(seconds * 1000000000.0 * timebase.denom / timebase.numer);
+}
+
+static kern_return_t ApplySenderRealtime(SenderRealtimeBudget budget) {
+    thread_time_constraint_policy_data_t policy = {MachTicks(budget.period), MachTicks(budget.computation),
+        MachTicks(budget.constraint), TRUE};
+    return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                             (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+static kern_return_t ReleaseSenderRealtime(void) {
+    thread_standard_policy_data_t policy = {0};
+    return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_STANDARD_POLICY,
+                             (thread_policy_t)&policy, THREAD_STANDARD_POLICY_COUNT);
+}
+
+// Whether the calling thread runs in the real-time band now: the time-constraint policy is set and
+// the policy in effect is no longer timeshare. `priority` receives the current priority.
+static BOOL SenderRealtimeEffective(int *priority) {
+    thread_t thread = pthread_mach_thread_np(pthread_self());
+    thread_time_constraint_policy_data_t constraint;
+    mach_msg_type_number_t constraintCount = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t constraintDefault = FALSE;
+    thread_extended_info_data_t state = {0};
+    mach_msg_type_number_t stateCount = THREAD_EXTENDED_INFO_COUNT;
+    if (thread_policy_get(thread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&constraint, &constraintCount,
+            &constraintDefault) != KERN_SUCCESS ||
+        thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&state, &stateCount) != KERN_SUCCESS) {
+        *priority = -1;
+        return NO;
+    }
+    *priority = state.pth_curpri;
+    return !constraintDefault && state.pth_policy != POLICY_TIMESHARE;
+}
+
+typedef struct {
+    BOOL applied;
+    BOOL effective;
+    BOOL effectiveAfterSleep;
+    BOOL released;
+    int priority;
+} RealtimeCheck;
+
+static void *RealtimeCheckThread(void *argument) {
+    RealtimeCheck *check = argument;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    LDACProfile profile;
+    if (!SelectProfile(96000, @"high", &profile)) return NULL;
+    check->applied = ApplySenderRealtime(SenderRealtimeBudgetFor(profile, 679)) == KERN_SUCCESS;
+    check->effective = SenderRealtimeEffective(&check->priority);
+    usleep(2000);
+    check->effectiveAfterSleep = SenderRealtimeEffective(&check->priority);
+    int released = 0;
+    check->released = ReleaseSenderRealtime() == KERN_SUCCESS && !SenderRealtimeEffective(&released);
+    return NULL;
+}
+
+// The helper's own thread is left alone: the policy is tried on a fresh thread, so the check also
+// shows whether a clamp on the process (taskpolicy, launchd) keeps it out of the real-time band.
+static BOOL RealtimeChecks(void) {
+    LDACProfile high, low, adaptive, cd;
+    if (!SelectProfile(96000, @"high", &high) || !SelectProfile(48000, @"low", &low) ||
+        !SelectProfile(48000, @"auto", &adaptive) || !SelectProfile(44100, @"mid", &cd)) return NO;
+    SenderRealtimeBudget budget = SenderRealtimeBudgetFor(high, 679);
+    BOOL passed = fabs(budget.period - 512.0 / 96000) < 1e-9 && fabs(budget.computation - budget.period / 4) < 1e-9 &&
+        fabs(budget.constraint - budget.period / 2) < 1e-9;
+    budget = SenderRealtimeBudgetFor(low, 2570);
+    passed &= fabs(budget.period - 768.0 / 48000) < 1e-9 && budget.computation == 0.002 && fabs(budget.constraint - 0.008) < 1e-9;
+    passed &= fabs(SenderRealtimeBudgetFor(adaptive, 679).period - 256.0 / 48000) < 1e-9;
+    budget = SenderRealtimeBudgetFor(cd, 679);
+    passed &= fabs(budget.period - 384.0 / 44100) < 1e-9 && budget.computation <= budget.constraint && budget.constraint < budget.period;
+    RealtimeCheck check = {0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, RealtimeCheckThread, &check) != 0 || pthread_join(thread, NULL) != 0) return NO;
+    printf("REALTIME_CHECK applied=%d effective=%d effectiveAfterSleep=%d priority=%d released=%d\n",
+           check.applied, check.effective, check.effectiveAfterSleep, check.priority, check.released);
+    return passed && check.applied && check.effective && check.effectiveAfterSleep && check.released;
 }
 
 static BOOL AdaptiveQuality(int eqmid) {
@@ -600,7 +840,8 @@ static BOOL SelfTest(void) {
     float input[256] = {0};
     float output[256] = {0};
     input[0] = 1; input[1] = -1;
-    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && ConvertPCM((const uint8_t *)input, 0.5, output);
+    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && RealtimeChecks() && BreachStreakChecks() &&
+        ConvertPCM((const uint8_t *)input, 0.5, output);
     passed &= output[0] == 0.5 && output[1] == -0.5 && output[255] == 0;
     const float invalid[] = {NAN, INFINITY, -INFINITY};
     for (NSUInteger sample = 0; sample < 3; sample++) {
@@ -730,7 +971,7 @@ static BOOL SelfTest(void) {
     BOOL reset = bytes > self.pcmReserveBytes;
     printf("PCM_SKIP frames=%lu totalSkippedFrames=%llu bufferedFrames=%lu encoderReset=%d resetAboveFrames=%lu\n",
            bytes / 8, self.pcmSkippedBytes / 8, self.pcmBytes / 8, reset, self.pcmReserveBytes / 8);
-    PrintSchedulerSample("PCM_SKIP", -1, self.schedulerBaseline);
+    PrintSchedulerSample("PCM_SKIP", -1, self.schedulerBaseline, TakeSchedulerSample());
     if (reset && !ResetEncoder(self.encoder, self.encoderMTU, self.profile)) {
         printf("PCM_FAILED reason=encoder-reset code=%d\n", ldacBT_get_error_code(self.encoder));
         self.failed = YES;
@@ -1076,6 +1317,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     id activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"LDAC streaming"];
     int qos = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     printf("STREAM_ACTIVITY qosStatus=%d\n", qos);
+    // The sender, PCM reads included, runs on this thread. If the policy is refused it streams as before.
+    SenderRealtimeBudget realtimeBudget = SenderRealtimeBudgetFor(probe.profile, probe.encoderMTU);
+    kern_return_t realtimeStatus = ApplySenderRealtime(realtimeBudget);
+    int realtimePriority = -1;
+    BOOL realtimeEffective = realtimeStatus == KERN_SUCCESS && SenderRealtimeEffective(&realtimePriority);
+    printf("REALTIME_POLICY requested=1 status=%d effective=%d priority=%d period=%.6f computation=%.6f constraint=%.6f\n",
+           realtimeStatus, realtimeEffective, realtimePriority, realtimeBudget.period, realtimeBudget.computation,
+           realtimeBudget.constraint);
     LDACProfile profile = probe.profile;
     LDACFrameFormat transmittedFormat = {profile.frameBytes, profile.bitrateKbps};
     LDACAdaptivePolicy adaptivePolicy = LDACAdaptivePolicyInit();
@@ -1118,6 +1367,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     BOOL limitStopped = NO;
     double lastLatenessAt = 0;
     double started = 0;
+    double sourceResync = 0;
     do {
         if (probe.closed || probe.failed || fd < 0) break;
         int socketType = 0;
@@ -1145,6 +1395,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         printf("SOCKET fd=%d CID=%04X outgoingMTU=%u type=%d baseline=%d\n",
                fd, owned.cid, owned.outgoingMTU, socketType, baseline);
         started = MonotonicTime();
+        // Packets are due at paceStart + timestamp / rate; paceStart moves later when the source falls behind.
+        double paceStart = started;
         probe.degradation = NewDegradation(started, profile.sampleRate, probe.pcmSkippedBytes);
         double deadline = continuous ? INFINITY : started + seconds + 1;
         double nextProgress = started + 1;
@@ -1156,7 +1408,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                gain, seconds, targetSamples, probe.pcmBytes / 8, probe.pcmReserveBytes / 8);
         SenderTiming timing = NewSenderTiming();
         probe.schedulerBaseline = TakeSchedulerSample();
-        PrintSchedulerSample("LIVE_BEGIN", -1, probe.schedulerBaseline);
+        PrintSchedulerSample("LIVE_BEGIN", -1, probe.schedulerBaseline, probe.schedulerBaseline);
+        BreachStreak breachStreaks[BreachKindCount] = {{0}};
         while (YES) {
             RecordSenderStage(&timing, SenderControl);
             PollLiveControls(probe);
@@ -1174,18 +1427,18 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 break;
             }
             probe.pcmCanSkip = !finishing && sourceSamples == generatedSamples;
-            double due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+            double due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
             if (continuous && !finishing && probe.pcmCanSkip) {
                 uint64_t previousSkipped = probe.pcmSkippedBytes;
                 RecordSenderStage(&timing, SenderPCM);
                 [probe pollPCM];
                 RecordSenderStage(&timing, SenderOther);
                 double now = MonotonicTime();
-                due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+                due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                 if (probe.pcmSkippedBytes != previousSkipped || now - due >= 0.1) RecordBreach(&recovery, now);
                 if (now - due >= PCMSkipLateness) {
                     NSUInteger skipped = [probe discardPCMFrames:(uint64_t)fmin((now - due) * profile.sampleRate, profile.sampleRate)];
-                    due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+                    due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                     if (skipped) printf("PCM_RECOVERY skippedFrames=%lu nextTimestamp=%llu late=%.6f strictPass=0\n",
                                         skipped, generatedSamples + probe.pcmSkippedBytes / 8, now - due);
                 }
@@ -1195,8 +1448,13 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 NSUInteger requiredBytes = inputFrames * 8;
                 adaptiveSourceReady &= probe.pcmBytes >= requiredBytes;
                 BOOL underflowBreached = NO;
+                BOOL sourceWait = probe.pcmBytes < requiredBytes;
+                double waitStart = MonotonicTime();
+                double blockDue = PacketDue(paceStart, sourceSamples + inputFrames + probe.pcmSkippedBytes / 8, profile);
+                double waitDue = continuous ? blockDue : due;
+                double waitLimit = SourceWaitLimit(continuous, due, blockDue, waitStart);
                 while (probe.pcmBytes < requiredBytes && !probe.closed && !probe.failed && !probe.inputEnded && !probe.stopRequested &&
-                       MonotonicTime() < due + 0.25 && MonotonicTime() < deadline) {
+                       MonotonicTime() < waitLimit && MonotonicTime() < deadline) {
                     RecordSenderStage(&timing, SenderControl);
                     PollLiveControls(probe);
                     RecordSenderStage(&timing, SenderInput);
@@ -1205,18 +1463,22 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     [probe pollPCM];
                     RecordSenderStage(&timing, SenderOther);
                     double now = MonotonicTime();
-                    if (probe.pcmBytes < requiredBytes && now - due >= 0.1 && !underflowBreached) {
+                    if (probe.pcmBytes < requiredBytes && now - waitDue >= 0.1 && !underflowBreached) {
                         underflowBreached = YES;
                         BOOL first = RecordBreach(&recovery, now);
                         double pollAt = MonotonicTime();
                         int count = kevent(queue, NULL, 0, &event, 1, &immediate);
                         int pollError = count < 0 ? errno : 0;
                         now = MonotonicTime();
-                        printf("PCM_BREACH sourceSamples=%llu late=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
-                               sourceSamples, now - due, first, lastPollAt - started, pollAt - lastPollAt, now - pollAt,
-                               lastPollCount, lastPollFlags, lastPollData, count, count > 0 ? event.flags : 0,
-                               count > 0 ? (long)event.data : 0, pollError);
-                        PrintSchedulerSample("PCM_BREACH", (long)sentPackets, probe.schedulerBaseline);
+                        SchedulerSample sample = TakeSchedulerSample();
+                        if (NoteBreach(&breachStreaks[BreachPCM], BreachKinds[BreachPCM], now, now - waitDue,
+                                       SchedulerWaiting(probe.schedulerBaseline, sample))) {
+                            printf("PCM_BREACH sourceSamples=%llu late=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
+                                   sourceSamples, now - waitDue, first, lastPollAt - started, pollAt - lastPollAt, now - pollAt,
+                                   lastPollCount, lastPollFlags, lastPollData, count, count > 0 ? event.flags : 0,
+                                   count > 0 ? (long)event.data : 0, pollError);
+                            PrintSchedulerSample("PCM_BREACH", (long)sentPackets, probe.schedulerBaseline, sample);
+                        }
                         lastPollAt = now;
                         lastPollCount = count;
                         lastPollFlags = count > 0 ? event.flags : 0;
@@ -1235,7 +1497,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 if (probe.stopRequested) continue;
                 if (probe.pcmBytes < requiredBytes || probe.closed || probe.failed || probe.inputEnded) {
                     limitStopped = !probe.closed && !probe.failed && !probe.inputEnded;
-                    if (limitStopped) {
+                    if (limitStopped && continuous) {
+                        // The capture has delivered nothing for a whole stall period: end the stream
+                        // as a recoverable failure, which the session restarts, not a hard error.
+                        limitStopped = NO;
+                        probe.failed = YES;
+                        printf("PCM_FAILED reason=source-stalled waitedSeconds=%.6f stallSeconds=%.3f sourceSamples=%llu bufferedFrames=%lu sourceResync=%.6f\n",
+                               MonotonicTime() - waitStart, PCMSourceStallSeconds, sourceSamples, probe.pcmBytes / 8, sourceResync);
+                    } else if (limitStopped) {
                         double pollAt = MonotonicTime();
                         int count = kevent(queue, NULL, 0, &event, 1, &immediate);
                         double now = MonotonicTime();
@@ -1248,6 +1517,12 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     printf("PCM_UNDERFLOW sourceSamples=%llu bufferedBytes=%lu late=%.6f limitStopped=%d\n",
                            sourceSamples, probe.pcmBytes, MonotonicTime() - due, limitStopped);
                     break;
+                }
+                double resync = sourceWait ? SourceResync(continuous, blockDue, MonotonicTime()) : 0;
+                if (resync > 0) {
+                    paceStart += resync;
+                    sourceResync += resync;
+                    due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                 }
                 BOOL wasRamping = probe.gainRampRemaining > 0;
                 double currentGain = probe.gain;
@@ -1320,15 +1595,19 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 int pollError = count < 0 ? errno : 0;
                 now = MonotonicTime();
                 RecordSenderStage(&timing, SenderOther);
-                printf("PACING_BREACH packet=%lu late=%.6f elapsed=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d controlWall=%.6f controlCPU=%.6f inputWall=%.6f inputCPU=%.6f pcmWall=%.6f pcmCPU=%.6f encodeWall=%.6f encodeCPU=%.6f pacingWall=%.6f pacingCPU=%.6f pacingMax=%.6f otherWall=%.6f otherCPU=%.6f\n",
-                       sentPackets, now - due, now - started, first, lastPollAt - started, pollAt - lastPollAt,
-                       now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
-                       count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError,
-                       timing.wall[SenderControl], timing.cpu[SenderControl], timing.wall[SenderInput], timing.cpu[SenderInput],
-                       timing.wall[SenderPCM], timing.cpu[SenderPCM], timing.wall[SenderEncode], timing.cpu[SenderEncode],
-                       timing.wall[SenderPacing], timing.cpu[SenderPacing], timing.maximumPacing,
-                       timing.wall[SenderOther], timing.cpu[SenderOther]);
-                PrintSchedulerSample("PACING_BREACH", (long)sentPackets, probe.schedulerBaseline);
+                SchedulerSample sample = TakeSchedulerSample();
+                if (NoteBreach(&breachStreaks[BreachPacing], BreachKinds[BreachPacing], now, now - due,
+                               SchedulerWaiting(probe.schedulerBaseline, sample))) {
+                    printf("PACING_BREACH packet=%lu late=%.6f elapsed=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d controlWall=%.6f controlCPU=%.6f inputWall=%.6f inputCPU=%.6f pcmWall=%.6f pcmCPU=%.6f encodeWall=%.6f encodeCPU=%.6f pacingWall=%.6f pacingCPU=%.6f pacingMax=%.6f otherWall=%.6f otherCPU=%.6f\n",
+                           sentPackets, now - due, now - started, first, lastPollAt - started, pollAt - lastPollAt,
+                           now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
+                           count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError,
+                           timing.wall[SenderControl], timing.cpu[SenderControl], timing.wall[SenderInput], timing.cpu[SenderInput],
+                           timing.wall[SenderPCM], timing.cpu[SenderPCM], timing.wall[SenderEncode], timing.cpu[SenderEncode],
+                           timing.wall[SenderPacing], timing.cpu[SenderPacing], timing.maximumPacing,
+                           timing.wall[SenderOther], timing.cpu[SenderOther]);
+                    PrintSchedulerSample("PACING_BREACH", (long)sentPackets, probe.schedulerBaseline, sample);
+                }
                 lastPollAt = now;
                 lastPollCount = count;
                 lastPollFlags = count > 0 ? event.flags : 0;
@@ -1377,11 +1656,15 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 if (drainDuration >= 0.1 && !drainBreached) {
                     drainBreached = YES;
                     BOOL first = RecordBreach(&recovery, now);
-                    printf("DRAIN_BREACH packet=%lu elapsed=%.6f duration=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
-                           sentPackets - 1, now - started, drainDuration, first, lastPollAt - started, pollAt - lastPollAt,
-                           now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
-                           count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError);
-                    PrintSchedulerSample("DRAIN_BREACH", (long)sentPackets - 1, probe.schedulerBaseline);
+                    SchedulerSample sample = TakeSchedulerSample();
+                    if (NoteBreach(&breachStreaks[BreachDrain], BreachKinds[BreachDrain], now, drainDuration,
+                                   SchedulerWaiting(probe.schedulerBaseline, sample))) {
+                        printf("DRAIN_BREACH packet=%lu elapsed=%.6f duration=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
+                               sentPackets - 1, now - started, drainDuration, first, lastPollAt - started, pollAt - lastPollAt,
+                               now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
+                               count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError);
+                        PrintSchedulerSample("DRAIN_BREACH", (long)sentPackets - 1, probe.schedulerBaseline, sample);
+                    }
                 }
                 lastPollAt = now;
                 lastPollCount = count;
@@ -1429,11 +1712,12 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     probe.gainAckReady = NO;
                 }
                 if (now >= nextProgress) {
-                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu\n",
+                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f\n",
                            sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
                            lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
-                           sentRTPSamples);
+                           sentRTPSamples, sourceResync);
                     nextProgress = now + 1;
+                    FlushBreachStreaks(breachStreaks, now, NO);
                 }
                 if (profile.adaptive && !finishing && !probe.stopRequested) {
                     int priority = LDACAdaptivePolicyObserve(&adaptivePolicy, ldacBT_get_eqmid(probe.encoder),
@@ -1455,6 +1739,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             }
             if (!drained || limitStopped) { printf("DRAIN_STOP packet=%lu elapsed=%.6f\n", sentPackets - 1, MonotonicTime() - started); break; }
         }
+        FlushBreachStreaks(breachStreaks, MonotonicTime(), YES);
         if (!probe.closed && !probe.failed && !probe.inputEnded && !limitStopped && flushed && sourceSamples == targetSamples && generatedSamples == sentSamples && drainedPackets == sentPackets)
             result = 0;
     } while (NO);
@@ -1479,13 +1764,15 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     if (probe.closed || probe.failed || probe.inputEnded) result = 5;
     double recoveryObserved = recovery.breached ? fmax(0, lastLatenessAt - recovery.firstBreach) : 0;
     int recoveredWithinOneSecond = recovery.recovered ? 1 : (recovery.breached && recoveryObserved >= 1 ? 0 : -1);
-    printf("FEED_COMPLETE result=%d strictPass=%d sentPackets=%lu drainedPackets=%lu sentBytes=%lu sentSamples=%llu drainedSamples=%llu sourceSamples=%llu generatedSamples=%llu targetSamples=%llu pcmReadBytes=%llu pcmDiscardedBytes=%llu bufferedFrames=%lu elapsed=%.6f closed=%d firstBreachElapsed=%.6f recoveredWithin1s=%d recoveryObservedSeconds=%.6f recoveryElapsed=%.6f limitStopped=%d skippedFrames=%llu rtpSamples=%llu paddingSamples=%llu\n",
+    printf("FEED_COMPLETE result=%d strictPass=%d sentPackets=%lu drainedPackets=%lu sentBytes=%lu sentSamples=%llu drainedSamples=%llu sourceSamples=%llu generatedSamples=%llu targetSamples=%llu pcmReadBytes=%llu pcmDiscardedBytes=%llu bufferedFrames=%lu elapsed=%.6f closed=%d firstBreachElapsed=%.6f recoveredWithin1s=%d recoveryObservedSeconds=%.6f recoveryElapsed=%.6f limitStopped=%d skippedFrames=%llu rtpSamples=%llu paddingSamples=%llu sourceResync=%.6f\n",
            result, result == 0 && !recovery.breached && !probe.pcmSkippedBytes, sentPackets, drainedPackets, sentBytes, sentSamples, drainedSamples,
            sourceSamples, generatedSamples, targetSamples, probe.pcmReadBytes, probe.pcmDiscardedBytes, probe.pcmBytes / 8,
            started ? MonotonicTime() - started : 0, probe.closed,
            recovery.breached ? recovery.firstBreach - started : -1, recoveredWithinOneSecond, recoveryObserved,
            recovery.recovered ? recovery.recoveryTime - recovery.firstBreach : -1, limitStopped,
-           probe.pcmSkippedBytes / 8, sentRTPSamples, generatedSamples >= sourceSamples ? generatedSamples - sourceSamples : 0);
+           probe.pcmSkippedBytes / 8, sentRTPSamples, generatedSamples >= sourceSamples ? generatedSamples - sourceSamples : 0,
+           sourceResync);
+    if (realtimeStatus == KERN_SUCCESS) printf("REALTIME_POLICY_RELEASED status=%d\n", ReleaseSenderRealtime());
     [NSProcessInfo.processInfo endActivity:activity];
     return result == 0;
 }

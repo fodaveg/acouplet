@@ -203,12 +203,14 @@ def fixture(root, mode):
     for label, app_name, version in ((native_label, 'Acouplet.app', 'old'), (legacy_label, 'XM5 Control Native.app', 'legacy'), (older_label, 'XM5 Control.app', 'older')):
         program = str(applications / app_name / ('Contents/MacOS/Acouplet' if label == native_label else 'Contents/MacOS/XM5 Control'))
         configs[label] = plistlib.dumps({'Label': label, 'ProgramArguments': [program, '--background-service'], 'KeepAlive': True, 'OldConfiguration': 'preserve'})
-        if mode in ('matching-plist', 'matching-plist-failure') and label == native_label:
+        if mode in ('matching-plist', 'matching-plist-failure', 'previous-plist') and label == native_label:
+            # previous-plist is the service installed before ProcessType was added; it must be rewritten.
+            current = {} if mode == 'previous-plist' else {'ProcessType': 'Interactive'}
             configs[label] = plistlib.dumps({
                 'KeepAlive': {'SuccessfulExit': False}, 'RunAtLoad': True, 'LimitLoadToSessionType': 'Aqua',
                 'AssociatedBundleIdentifiers': ['dev.baglayan.Acouplet'],
                 'EnvironmentVariables': {'ACOUPLET_SERVICE_POLICY': 'successful-exit-v1'},
-                'ProgramArguments': [program, '--background-service'], 'Label': label,
+                'ProgramArguments': [program, '--background-service'], 'Label': label, **current,
             }, fmt=plistlib.FMT_BINARY, sort_keys=False)
         (agents / (label + '.plist')).write_bytes(configs[label])
         if mode in ('matching-plist', 'matching-plist-failure') and label == native_label:
@@ -247,7 +249,7 @@ def fixture(root, mode):
         plist.unlink()
         plist.symlink_to(root / 'Preferences/dev.baglayan.Acouplet.plist')
     (root / 'state.json').write_text(json.dumps(state))
-    (root / 'login-item.json').write_text(json.dumps({'enabled': mode in ('success', 'matching-plist', 'fresh-install', 'inactive-update', 'login-item-rollback', 'helper-failure')}))
+    (root / 'login-item.json').write_text(json.dumps({'enabled': mode in ('success', 'matching-plist', 'previous-plist', 'fresh-install', 'inactive-update', 'login-item-rollback', 'helper-failure')}))
     (root / 'processes.json').write_text(json.dumps({
         'native': [] if mode in ('inactive-update', 'fresh-install', 'login-item-rollback') else [100, 101] if mode == 'native-partial-quit' else [100],
         'quit_requested': False, 'exit_checks': 0,
@@ -270,7 +272,7 @@ def run(root, mode, name='Install.command', arguments=()):
     return subprocess.run(['/bin/zsh', str(command), *arguments], env=env, text=True, capture_output=True, timeout=30)
 
 
-scenarios = ('helper-failure', 'success', 'matching-plist', 'matching-plist-failure', 'fresh-install', 'inactive-update', 'staging-failure',
+scenarios = ('helper-failure', 'success', 'matching-plist', 'matching-plist-failure', 'previous-plist', 'fresh-install', 'inactive-update', 'staging-failure',
              'bootstrap-failure', 'stop-failure', 'restore-app-failure', 'restore-plist-failure',
              'move-new-failure', 'restart-failure', 'legacy-stop-failure', 'legacy-running',
              'legacy-unregister-failure', 'legacy-helper-failure', 'legacy-bad-signature', 'legacy-wrong-team', 'installed-wrong-team', 'legacy-quit-success', 'legacy-quit-declined', 'installed-bad-signature', 'installed-validation-failure', 'native-register-failure', 'unexpected-bundle', 'unexpected-agent',
@@ -296,7 +298,7 @@ for scenario in scenarios:
             result = run(root, scenario)
         output = result.stdout + result.stderr
         state = json.loads((root / 'state.json').read_text())
-        successful = scenario in ('success', 'matching-plist', 'fresh-install', 'inactive-update',
+        successful = scenario in ('success', 'matching-plist', 'previous-plist', 'fresh-install', 'inactive-update',
                                   'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success', 'ldac-owner-running',
                                   'agent-exited')
         assert (result.returncode == 0) == successful, (scenario, result.returncode, output)
@@ -326,8 +328,10 @@ for scenario in scenarios:
                 'ProgramArguments': [str(native / 'Contents/MacOS/Acouplet'), '--background-service'],
                 'AssociatedBundleIdentifiers': ['dev.baglayan.Acouplet'],
                 'LimitLoadToSessionType': 'Aqua', 'RunAtLoad': True, 'KeepAlive': {'SuccessfulExit': False},
-                'EnvironmentVariables': {'ACOUPLET_SERVICE_POLICY': 'successful-exit-v1'},
+                'EnvironmentVariables': {'ACOUPLET_SERVICE_POLICY': 'successful-exit-v1'}, 'ProcessType': 'Interactive',
             }, output
+            if scenario == 'previous-plist':
+                assert plist.read_bytes() != before_plist, output
             assert not legacy.exists() and not (applications / 'XM5 Control.app').exists(), output
             assert not state[legacy_label]['loaded'] and not (agents / (legacy_label + '.plist')).exists(), state
         elif scenario in ('legacy-unregister-failure', 'legacy-helper-failure'):
