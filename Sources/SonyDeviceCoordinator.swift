@@ -81,6 +81,7 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
     /// consulta al arrancar, al despertar y en `centralManagerDidUpdateState`, no en cada sondeo del inventario.
     var cachedBluetoothAuthorization: CBManagerAuthorization = .notDetermined
     var connectNotification: IOBluetoothUserNotification?
+    var inventoryNotificationCount = 0
     var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
     var discoveryGeneration: UInt64 = 0
     @Published var isDiscovering = false

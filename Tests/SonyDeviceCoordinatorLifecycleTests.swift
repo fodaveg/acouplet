@@ -1,5 +1,6 @@
 import Combine
 import CoreBluetooth
+@preconcurrency import IOBluetooth
 import XCTest
 @testable import Acouplet
 
@@ -394,6 +395,31 @@ final class SonyDeviceCoordinatorLifecycleTests: XCTestCase {
         XCTAssertFalse(controller.isPollingActive)
         controller.setPollingActive(true)
         XCTAssertFalse(controller.isPollingActive)
+    }
+
+    func testIOBluetoothCallbacksFromAnotherQueueHopToMainWithoutTrapping() async throws {
+        let devices = makeCoordinator()
+        defer { devices.stop() }
+        devices.isRunning = true
+        devices.reconcileDiscoveredDevices([earbuds], connectedAddresses: [earbuds.address])
+        let controller = try XCTUnwrap(devices.controller(for: earbuds.address))
+        devices.cachedBluetoothAuthorization = .denied
+        let device = try XCTUnwrap(IOBluetoothDevice(addressString: earbuds.address))
+        let queue = DispatchQueue(label: "test.iobluetooth.coordinatorQueue")
+        nonisolated(unsafe) let unsafeDevice = device
+        nonisolated(unsafe) let unsafeDevices = devices
+        for _ in 0..<2 {
+            let finished = expectation(description: "callback returned")
+            queue.async {
+                _ = unsafeDevices.perform(#selector(SonyDeviceCoordinator.bluetoothDeviceConnected(_:device:)), with: nil, with: unsafeDevice)
+                _ = unsafeDevices.perform(#selector(SonyDeviceCoordinator.bluetoothDeviceDisconnected(_:device:)), with: nil, with: unsafeDevice)
+                finished.fulfill()
+            }
+            await fulfillment(of: [finished], timeout: 5)
+        }
+        for _ in 0..<100 where devices.inventoryNotificationCount < 4 { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(devices.inventoryNotificationCount, 4)
+        XCTAssertTrue(controller.isBluetoothAccessDenied)
     }
 
     private func makeCoordinator() -> SonyDeviceCoordinator {

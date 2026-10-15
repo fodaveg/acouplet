@@ -147,15 +147,27 @@ extension SonyDeviceCoordinator {
         disconnectNotifications = [:]
     }
 
-    @objc func bluetoothDeviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+    /// IOBluetooth entrega estas notificaciones en su propia cola, no en el main: los callbacks son `nonisolated`
+    /// y saltan al actor principal antes de tocar estado del coordinador.
+    @objc nonisolated func bluetoothDeviceConnected(_ notification: IOBluetoothUserNotification?, device: IOBluetoothDevice) {
+        nonisolated(unsafe) let device = device
+        Task { @MainActor [self] in handleBluetoothDeviceConnected(device) }
+    }
+
+    @objc nonisolated func bluetoothDeviceDisconnected(_ notification: IOBluetoothUserNotification?, device: IOBluetoothDevice) {
+        let address = device.addressString.flatMap(SonyBLEIdentity.normalizedAddress)
+        Task { @MainActor [self] in handleBluetoothDeviceDisconnected(address: address) }
+    }
+
+    func handleBluetoothDeviceConnected(_ device: IOBluetoothDevice) {
+        inventoryNotificationCount += 1
         watchDisconnection(of: device)
         refreshPairedInventory()
     }
 
-    @objc func bluetoothDeviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        if let address = device.addressString.flatMap(SonyBLEIdentity.normalizedAddress) {
-            disconnectNotifications.removeValue(forKey: address)?.unregister()
-        }
+    func handleBluetoothDeviceDisconnected(address: String?) {
+        inventoryNotificationCount += 1
+        if let address { disconnectNotifications.removeValue(forKey: address)?.unregister() }
         refreshPairedInventory()
     }
 
