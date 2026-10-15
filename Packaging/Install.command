@@ -2,6 +2,8 @@
 set -euo pipefail
 
 package_dir="${0:A:h}"
+# --require-stopped is the local-build mode: it quits the running app and service like any update,
+# and also verifies the package against its Local Build Receipt and writes an install receipt.
 require_stopped=false
 if (( $# )); then
     if (( $# != 1 )) || [[ "$1" != --require-stopped ]]; then
@@ -24,20 +26,30 @@ domain="gui/$(id -u)"
 plist_path="$HOME/Library/LaunchAgents/$label.plist"
 backup_plist="$plist_path.previous-$$"
 process_pattern='^/Applications/Acouplet\.app/Contents/MacOS/Acouplet( |$)'
+ldac_owner_command='/Applications/Acouplet\.app/Contents/MacOS/Acouplet --ldac-owner'
 legacy_apps=("/Applications/XM5 Control Native.app" "/Applications/XM5 Control.app")
 legacy_identifiers=(local.xm5control.native local.xm5control)
 legacy_labels=(local.xm5control.native.agent local.xm5control.agent)
 legacy_patterns=('^/Applications/XM5 Control Native\.app/Contents/MacOS/XM5 Control( |$)' '^/Applications/XM5 Control\.app/Contents/MacOS/XM5 Control( |$)')
 legacy_loaded=()
 
-if [[ "$require_stopped" == true ]]; then
-    for pattern in "$process_pattern" "$legacy_patterns[@]"; do
-        if /usr/bin/pgrep -f "$pattern" >/dev/null; then
-            print -u2 "Quit Acouplet and its previous versions normally before installing this update. Nothing was replaced."
-            exit 1
-        fi
+# Prints the IDs of the running processes that match a pattern, one per line. Acouplet's LDAC owner
+# worker runs the same executable; it only restores the audio route and exits on its own, so it does
+# not count as a running app.
+running_pids() {
+    local pids owners pid
+    pids="$(/usr/bin/pgrep -f "$1" || true)"
+    [[ -n "$pids" ]] || return 0
+    if [[ "$1" != "$process_pattern" ]]; then
+        print -r -- "$pids"
+        return 0
+    fi
+    owners="$(/usr/bin/pgrep -fx "$ldac_owner_command" || true)"
+    for pid in ${(f)pids}; do
+        [[ $'\n'"$owners"$'\n' == *$'\n'"$pid"$'\n'* ]] || print -r -- "$pid"
     done
-fi
+}
+
 if (( EUID == 0 )); then
     print -u2 "Run this installer as your normal logged-in user, without sudo."
     exit 1
@@ -297,12 +309,8 @@ fi
 quit_patterns=("$process_pattern" "$legacy_patterns[@]")
 quit_identifiers=(dev.baglayan.Acouplet "$legacy_identifiers[@]")
 for index in {1..3}; do
-    original_pids="$(/usr/bin/pgrep -f "$quit_patterns[$index]" || true)"
+    original_pids="$(running_pids "$quit_patterns[$index]")"
     if [[ -n "$original_pids" ]]; then
-        if [[ "$require_stopped" == true ]]; then
-            print -u2 "An application opened again. Quit it normally before installing; nothing was replaced."
-            exit 1
-        fi
         if ! /usr/bin/osascript - "$quit_identifiers[$index]" <<'APPLESCRIPT'
 on run arguments
     with timeout of 30 seconds
@@ -358,12 +366,12 @@ for pattern in "$legacy_patterns[@]"; do
     fi
 done
 for attempt in {1..20}; do
-    if ! /usr/bin/pgrep -f "$process_pattern" >/dev/null; then
+    if [[ -z "$(running_pids "$process_pattern")" ]]; then
         break
     fi
     sleep 0.25
 done
-if /usr/bin/pgrep -f "$process_pattern" >/dev/null; then
+if [[ -n "$(running_pids "$process_pattern")" ]]; then
     print -u2 "Acouplet has not stopped. No app files were replaced; try again after it closes."
     exit 1
 fi

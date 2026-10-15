@@ -233,7 +233,7 @@ if [[ "$local_update" == true ]]; then
     if [[ "$signing_identity" == - ]]; then
         print "This ad-hoc build may request Bluetooth permission again. Use a consistent Apple signing identity to retain access across updates."
     fi
-    print "Quit the installed app, then run:"
+    print "Install it with the command below. It quits the running app and its background service itself:"
     print -r -- "  \"$package_dir/Install.command\" --require-stopped"
     print -r -- "Build receipt: $receipt"
 elif [[ "$direct_release" == true ]]; then

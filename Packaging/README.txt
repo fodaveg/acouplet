@@ -4,7 +4,7 @@ Requires macOS 15.4 or later. This package is not notarized.
 
 Install or update
 
-1. Finish any active headphone operation and quit Acouplet.
+1. Finish any active headphone operation. The installer quits Acouplet itself.
 2. Keep the extracted package together and open Install.command without sudo.
 3. Open Acouplet from Applications.
 

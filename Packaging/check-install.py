@@ -51,9 +51,17 @@ elif name == 'plutil':
         assert args[0] == '-lint', args
 elif name == 'pgrep':
     processes = json.loads(process_file.read_text())
+    owners = processes.get('owner', [])
+    if args[0] == '-fx':
+        assert args[-1].endswith('/Acouplet --ldac-owner'), args
+        if not owners: sys.exit(1)
+        print('\n'.join(str(pid) for pid in owners))
+        sys.exit(0)
     key = 'legacy' if 'XM5 Control Native' in args[-1] else 'older' if 'XM5 Control' in args[-1] else 'native'
-    if processes[key]:
-        print('\n'.join(str(pid) for pid in processes[key]))
+    # The LDAC owner worker runs the app's executable, so the app's own pattern finds it too.
+    matches = processes[key] + (owners if key == 'native' else [])
+    if matches:
+        print('\n'.join(str(pid) for pid in matches))
     else:
         sys.exit(0 if mode == 'legacy-running' and 'XM5 Control Native' in args[-1] else 1)
 elif name == 'kill':
@@ -229,6 +237,7 @@ def fixture(root, mode):
         'quit_requested': False, 'exit_checks': 0,
         'legacy': [200] if mode in ('legacy-quit-success', 'legacy-quit-declined') else [],
         'older': [201] if mode == 'legacy-quit-success' else [],
+        'owner': [150] if mode == 'ldac-owner-running' else [],
     }))
     return configs, state
 
@@ -253,7 +262,7 @@ scenarios = ('helper-failure', 'success', 'matching-plist', 'matching-plist-fail
              'unrelated-legacy', 'repurposed-legacy', 'symlink-agent', 'orphan-service', 'concurrent-install',
              'native-quit-declined', 'native-quit-timeout', 'native-quit-stalled', 'native-partial-quit',
              'native-keepalive-relaunch', 'native-delayed-quit', 'login-item-rollback',
-             'controls-unregister-failure', 'embedded-controls', 'foreign-controls')
+             'controls-unregister-failure', 'embedded-controls', 'foreign-controls', 'ldac-owner-running')
 for scenario in scenarios:
     with tempfile.TemporaryDirectory(prefix='acouplet-install-check-') as directory:
         root = Path(directory)
@@ -271,7 +280,7 @@ for scenario in scenarios:
         output = result.stdout + result.stderr
         state = json.loads((root / 'state.json').read_text())
         successful = scenario in ('success', 'matching-plist', 'fresh-install', 'inactive-update',
-                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success')
+                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success', 'ldac-owner-running')
         assert (result.returncode == 0) == successful, (scenario, result.returncode, output)
         recovery_apps = [path for path in applications.glob('.*previous-*.app') if 'interrupted' not in path.name]
         recovery_plists = [path for path in agents.glob('*.previous-*') if 'interrupted' not in path.name]
@@ -344,7 +353,7 @@ for scenario in scenarios:
             assert ['osascript', '-', 'local.xm5control.native'] in commands and ['osascript', '-', 'local.xm5control'] in commands, commands
             first_move = next(index for index, command in enumerate(commands) if command[0] == 'mv')
             assert commands.index(['kill', '-0', '200']) < first_move and commands.index(['kill', '-0', '201']) < first_move, commands
-        if scenario in ('success', 'native-keepalive-relaunch', 'native-delayed-quit'):
+        if scenario in ('success', 'native-keepalive-relaunch', 'native-delayed-quit', 'ldac-owner-running'):
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
             quit_index = commands.index(['osascript', '-', 'dev.baglayan.Acouplet'])
             bootout_index = next(index for index, command in enumerate(commands)
@@ -412,10 +421,10 @@ for scenario in ('success', 'orphan-service', 'unexpected-agent', 'unexpected-lo
         assert (root / 'Preferences/dev.baglayan.Acouplet.plist').read_text() == 'preserve'
         print('uninstall-' + scenario + ': passed')
 
-for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-stage-changed', 'local-hud-check-changed', 'local-ldac-media-changed', 'local-audio-capture-changed', 'local-output-driver-changed', 'local-output-driver-info-changed', 'local-driver-installer-changed', 'local-driver-uninstaller-changed', 'local-resource-seal-changed'):
+for scenario in ('running', 'running-release-changed', 'local-stopped', 'local-release-changed', 'local-stage-changed', 'local-hud-check-changed', 'local-ldac-media-changed', 'local-audio-capture-changed', 'local-output-driver-changed', 'local-output-driver-info-changed', 'local-driver-installer-changed', 'local-driver-uninstaller-changed', 'local-resource-seal-changed'):
     with tempfile.TemporaryDirectory(prefix='acouplet-local-install-check-') as directory:
         root = Path(directory)
-        mode = 'success' if scenario == 'running' else 'inactive-update'
+        mode = 'success' if scenario.startswith('running') else 'inactive-update'
         _, initial_state = fixture(root, mode)
         source = root / 'package/Acouplet.app'
         binaries = ('Contents/MacOS/Acouplet', 'Contents/Helpers/Acouplet Battery Publisher', 'Contents/Frameworks/SonyNativeHUD.dylib', 'Contents/Helpers/SonyNativeHUDCheck', 'Contents/Resources/Assets.car', 'Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle', 'Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate', 'Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater', 'Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer', 'Contents/Helpers/LDACSignaling', 'Contents/Helpers/LDACMediaTransport', 'Contents/Helpers/SonyAudioConnection', 'Contents/Helpers/LDACLogObserver', 'Contents/Helpers/Acouplet Audio.app/Contents/MacOS/AcoupletAudio', 'Contents/Helpers/AcoupletLDACOutput.driver/Contents/MacOS/AcoupletVirtualOutput', 'Contents/Helpers/AcoupletLDACOutput.driver/Contents/Info.plist', 'Contents/Resources/Acouplet LDAC Output.pkg', 'Contents/Resources/Acouplet LDAC Removal.pkg', 'Contents/_CodeSignature/CodeResources')
@@ -428,7 +437,7 @@ for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-sta
         lines = ['Prepared UTC: 2026-09-27T00:00:00Z', 'Revision: fixture', 'Worktree: dirty', 'Release app: ' + str(release)]
         lines += ['SHA256\t' + hashlib.sha256((source / relative).read_bytes()).hexdigest() + '\t' + relative for relative in binaries]
         (root / 'package/Local Build Receipt.txt').write_text('\n'.join(lines) + '\n')
-        if scenario == 'local-release-changed': (release / binaries[0]).write_text('later build')
+        if scenario in ('local-release-changed', 'running-release-changed'): (release / binaries[0]).write_text('later build')
         if scenario == 'local-stage-changed': (source / binaries[1]).write_text('changed stage')
         if scenario == 'local-hud-check-changed': (source / 'Contents/Helpers/SonyNativeHUDCheck').write_text('changed probe')
         if scenario == 'local-ldac-media-changed': (source / 'Contents/Helpers/LDACMediaTransport').write_text('changed encoder')
@@ -440,16 +449,17 @@ for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-sta
         if scenario == 'local-resource-seal-changed': (source / 'Contents/_CodeSignature/CodeResources').write_text('changed resource seal')
         result = run(root, mode, arguments=('--require-stopped',))
         commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
-        assert not any(command[0] == 'osascript' for command in commands), commands
+        # The local-build mode quits the running app itself, but only once the receipt has been verified.
+        assert any(command[0] == 'osascript' for command in commands) == (scenario == 'running'), commands
         receipts = list(root.glob('Local Install-*.txt'))
         installed = root / 'Applications/Acouplet.app'
-        if scenario == 'local-stopped':
+        if scenario in ('local-stopped', 'running'):
             assert result.returncode == 0, result.stdout + result.stderr
             assert len(receipts) == 1
             assert 'Release/staged/installed identity and strict signature verification: passed' in receipts[0].read_text()
             assert 'Installed UTC:' in receipts[0].read_text()
             for relative in binaries: assert (installed / relative).read_bytes() == (release / relative).read_bytes()
-            assert not json.loads((root / 'state.json').read_text())[native_label]['loaded']
+            assert json.loads((root / 'state.json').read_text())[native_label]['loaded'] == (scenario == 'running')
         else:
             assert result.returncode != 0, result.stdout + result.stderr
             assert not receipts
