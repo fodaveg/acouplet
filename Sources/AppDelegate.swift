@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
     private var globalHotKeyController: GlobalHotKeyController?
     private var menuBarController: MenuBarController?
+    private var preferencePaneServer: SonyPreferencePaneServer?
     private var cancellables = Set<AnyCancellable>()
     private var deviceAlertObservers: [ObjectIdentifier: AnyCancellable] = [:]
     private var testTerminationObserver: AnyCancellable?
@@ -218,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.environment.devices.systemDidWake() }
             .store(in: &cancellables)
         environment.devices.start()
+        startPreferencePaneServer()
         globalHotKeyController = GlobalHotKeyController { [weak self] in
             self?.environment.headphones.toggleNoiseControl()
         }
@@ -361,7 +363,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     #endif
 
+    /// Starts the local connection that the device preference panes read (decision D10).
+    ///
+    /// The server listens in this process's `~/tmp`, which is where the panes look only when the app runs in
+    /// its sandbox container. Outside the sandbox it starts only if device panes are installed, so it does
+    /// not create `~/tmp` in the home folder for nothing.
+    private func startPreferencePaneServer() {
+        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
+        let panes = getpwuid(getuid()).map { URL(fileURLWithPath: String(cString: $0.pointee.pw_dir))
+            .appending(path: "Library/PreferencePanes") }
+        let hasDevicePanes = panes.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) }?
+            .contains { $0.hasPrefix("Sony-") && $0.hasSuffix(".prefPane") } == true
+        guard sandboxed || hasDevicePanes else { return }
+        let server = SonyPreferencePaneServer(devices: environment.devices)
+        do {
+            try server.start()
+            preferencePaneServer = server
+        } catch {
+            NSLog("The device preference panes cannot connect: %@", error.localizedDescription)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        preferencePaneServer?.stop()
+        preferencePaneServer = nil
         menuBarController?.stop()
         menuBarController = nil
         #if !ACOUPLET_PUBLIC_APIS_ONLY
