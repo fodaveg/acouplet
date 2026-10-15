@@ -263,6 +263,7 @@ final class LDACNativeSession: @unchecked Sendable {
     private var pcmWrite: Int32 = -1
     private var rawURL: URL?
     private var log: FileHandle?
+    private var logURL: URL?
     private var diagnosticsLock: FileHandle?
     private var loggedBytes = 0
 
@@ -363,6 +364,7 @@ final class LDACNativeSession: @unchecked Sendable {
             let logURL = directory.appendingPathComponent("session.log")
             FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
             log = try FileHandle(forWritingTo: logURL)
+            self.logURL = logURL
             if restoringOnly {
                 shutdownChecked = true
                 restoring = true
@@ -1289,18 +1291,34 @@ final class LDACNativeSession: @unchecked Sendable {
     }
 
     private func record(_ line: String) {
-        let data = Data("\(Date().timeIntervalSince1970) \(line)\n".utf8)
-        if loggedBytes + data.count > 8 * 1024 * 1024 {
-            do {
-                try log?.truncate(atOffset: 0)
-                try log?.seek(toOffset: 0)
-                loggedBytes = 0
-            } catch { return }
+        guard let logURL else { return }
+        loggedBytes = Self.appendSessionLog(Data("\(Date().timeIntervalSince1970) \(line)\n".utf8), to: &log, at: logURL,
+                                            loggedBytes: loggedBytes)
+    }
+
+    /// Appends `data` to the session log at `url` and returns the bytes now in it (L13).
+    ///
+    /// When the log would pass `limit`, it becomes `session.log.1`, replacing an older one, and a new log starts,
+    /// so a session keeps its first lines and stays under twice the limit. Emptying the log in place lost the
+    /// first 175 s of a session. If the new log cannot be opened, the session stops logging.
+    static func appendSessionLog(_ data: Data, to log: inout FileHandle?, at url: URL, loggedBytes: Int,
+                                 limit: Int = 8 * 1024 * 1024) -> Int {
+        guard let current = log else { return loggedBytes }
+        var loggedBytes = loggedBytes
+        if loggedBytes > 0, loggedBytes + data.count > limit {
+            guard rename(url.path, url.path + ".1") == 0 else { return loggedBytes }
+            try? current.close()
+            log = nil
+            guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]),
+                  let next = try? FileHandle(forWritingTo: url) else { return 0 }
+            log = next
+            loggedBytes = 0
         }
         do {
             try log?.write(contentsOf: data)
             loggedBytes += data.count
         } catch {}
+        return loggedBytes
     }
 }
 

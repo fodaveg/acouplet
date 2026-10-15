@@ -150,6 +150,38 @@ enum LDACSessionDiagnosticsCheck {
         precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) == nil && made == 1)
         defaults.removeObject(forKey: LDACPlaybackPriority.disabledKey)
         precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) != nil && made == 2)
-        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths; the playback priority A/B switch skips the driver request only while set")
+        try checkSessionLogRotation(in: root)
+        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths; the playback priority A/B switch skips the driver request only while set; a full session log moves to session.log.1 and a new one starts")
+    }
+
+    /// A full session log keeps its lines in `session.log.1`, replacing an older one, and logging goes on in a new
+    /// `session.log`, so a session never holds more than twice the limit (L13).
+    private static func checkSessionLogRotation(in root: URL) throws {
+        let directory = root.appendingPathComponent("rotation", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let url = directory.appendingPathComponent("session.log")
+        let previous = directory.appendingPathComponent("session.log.1")
+        precondition(FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]))
+        var log: FileHandle? = try FileHandle(forWritingTo: url)
+        defer { try? log?.close() }
+        var bytes = 0
+        func append(_ text: String) {
+            bytes = LDACNativeSession.appendSessionLog(Data(text.utf8), to: &log, at: url, loggedBytes: bytes, limit: 12)
+        }
+        func contents(_ file: URL) -> String? { (try? Data(contentsOf: file)).map { String(decoding: $0, as: UTF8.self) } }
+        append("first\n")
+        append("more\n")
+        precondition(contents(url) == "first\nmore\n" && bytes == 11 && !FileManager.default.fileExists(atPath: previous.path),
+                     "The log rotated before it was full")
+        append("third\n")
+        precondition(contents(previous) == "first\nmore\n", "The first lines of the session were lost")
+        precondition(contents(url) == "third\n" && bytes == 6)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        precondition((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        append("fourth\n")
+        precondition(contents(previous) == "third\n", "An older session.log.1 was kept instead of replaced")
+        precondition(contents(url) == "fourth\n")
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
+        precondition(names == ["session.log", "session.log.1"], "\(names)")
     }
 }
