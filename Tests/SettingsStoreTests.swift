@@ -316,6 +316,28 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundServiceModeFollowsThePlistStateNotTheLaunchArguments() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = SettingsStore(defaults: defaults)
+        XCTAssertFalse(settings.isBackgroundServiceProcess)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertFalse(settings.launchAtLogin)
+
+        settings.applyLaunchStatus(background: .enabled, launchAtLogin: false)
+        XCTAssertTrue(settings.hasBackgroundService, "A copy started without --background-service still sees the installed service")
+        settings.applyLaunchStatus(background: .requiresApproval, launchAtLogin: false)
+        XCTAssertTrue(settings.hasBackgroundService, "A service turned off in Login Items is still the startup mode")
+        settings.applyLaunchStatus(background: .notRegistered, launchAtLogin: true)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertTrue(settings.launchAtLogin)
+        settings.applyLaunchStatus(background: .notFound, launchAtLogin: false)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertFalse(settings.launchAtLogin)
+    }
+
+    @MainActor
     func testFirstLaunchOfEachBuildIsReportedOnceAcrossRelaunches() throws {
         let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

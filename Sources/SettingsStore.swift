@@ -101,6 +101,7 @@ final class SettingsStore: ObservableObject {
     private var isLoadingEqualizerDraft = false
 
     private let managesLaunchService: Bool
+    private var isRefreshingLaunchStatus = false
     private let preferencesDomain: String?
     private let languageAtLaunch: AppLanguage
 
@@ -126,7 +127,8 @@ final class SettingsStore: ObservableObject {
         reconnectAutomatically = defaults.object(forKey: Keys.reconnectAutomatically) == nil
             ? true
             : defaults.bool(forKey: Keys.reconnectAutomatically)
-        launchAtLogin = managesLaunchService && SMAppService.mainApp.status == .enabled
+        // Filled in by refreshLaunchStatus() below, off the main thread.
+        launchAtLogin = false
         globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) == nil
             ? true
             : defaults.bool(forKey: Keys.globalShortcutEnabled)
@@ -192,18 +194,39 @@ final class SettingsStore: ObservableObject {
         isLoadingEqualizerDraft = false
     }
 
+    /// Reads the LaunchAgent's and the login item's state in the background and publishes them on the main
+    /// actor. Each read is a synchronous XPC call of about 15 ms, and Settings asks again every time it
+    /// appears or becomes active.
     func refreshLaunchStatus() {
-        guard managesLaunchService, let user = getpwuid(getuid()) else { return }
+        guard managesLaunchService, !isRefreshingLaunchStatus, let plist = Self.backgroundServicePlist else { return }
+        isRefreshingLaunchStatus = true
+        Task.detached(priority: .utility) { [weak self] in
+            let background = SMAppService.statusForLegacyPlist(at: plist)
+            let launchesAtLogin = SMAppService.mainApp.status == .enabled
+            await self?.applyLaunchStatus(background: background, launchAtLogin: launchesAtLogin)
+        }
+    }
+
+    func applyLaunchStatus(background: SMAppService.Status, launchAtLogin: Bool) {
+        isRefreshingLaunchStatus = false
+        if backgroundServiceStatus != background { backgroundServiceStatus = background }
+        if self.launchAtLogin != launchAtLogin { self.launchAtLogin = launchAtLogin }
+    }
+
+    private static var backgroundServicePlist: URL? {
+        guard let user = getpwuid(getuid()) else { return nil }
         let home = String(cString: user.pointee.pw_dir)
-        let plist = URL(fileURLWithPath: home).appending(path: "Library/LaunchAgents/dev.baglayan.Acouplet.agent.plist")
-        backgroundServiceStatus = SMAppService.statusForLegacyPlist(at: plist)
-        launchAtLogin = SMAppService.mainApp.status == .enabled
+        return URL(fileURLWithPath: home).appending(path: "Library/LaunchAgents/dev.baglayan.Acouplet.agent.plist")
     }
 
     func enableLaunchAtLoginByDefault() {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        guard !hasBackgroundService, !isBackgroundServiceProcess,
-              !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
+        guard !isBackgroundServiceProcess, !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
+        // This runs once per installation, so it may wait for the service's state instead of the background read.
+        if managesLaunchService, let plist = Self.backgroundServicePlist {
+            backgroundServiceStatus = SMAppService.statusForLegacyPlist(at: plist)
+        }
+        guard !hasBackgroundService else { return }
         defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
         if !managesLaunchService || SMAppService.mainApp.status == .notRegistered {
             setLaunchAtLogin(true)
