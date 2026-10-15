@@ -149,6 +149,45 @@ extension LDACNativeSession {
         for value in session.children.values { value.closeInput() }
         print("PASS actual session restore-disconnect argument binding handle=\(handle.map(String.init) ?? "none")")
     }
+
+    /// L8: with the connector's handle stuck at 0000, bluetoothd's per-connection ACL lines are the ownership
+    /// evidence. A later ACL line for the target means the current connection is someone else's.
+    static func checkRestoreOwnership(executable: URL, laterACL: String?) throws {
+        let session = LDACNativeSession(id: UUID(), address: "02:00:00:00:00:01", helpers: Helpers(fixture: executable), gain: 0) { _ in }
+        let disconnect = try LDACNativeChild(executable: executable, arguments: ["fixture-disconnect"], inheritedPCM: nil)
+        session.children["disconnect"] = disconnect
+        let connector = try LDACNativeChild(executable: executable, arguments: ["fixture-disconnect"], inheritedPCM: nil)
+        session.children["connector"] = connector
+        session.stop(restoreAudio: true)
+        try session.handle("daemon", line: "2026-10-15 05:47:14.255715+0200  localhost bluetoothd[459]: (CoreUtils) [com.apple.bluetooth:CBStackDeviceMonitor] ACL connected: 02:00:00:00:00:01, result 0")
+        try require(session.connected, "The fixture did not observe the owned ACL")
+        try session.handle("connector", line: "CONNECT_READY handle=0000 guarded=0")
+        try require(session.connectorReady && session.connectorHandle == 0 && !session.connectorHandleGuarded,
+            "An unusable connector handle was trusted as a connection guard")
+        try session.handle("daemon", line: "2026-10-15 05:47:20.000000+0200  localhost bluetoothd[459]: (CoreUtils) [com.apple.bluetooth:CBStackDeviceMonitor] ACL connected: 02:00:00:00:00:09, result 0")
+        if let laterACL {
+            try session.handle("daemon", line: "2026-10-15 05:47:21.000000+0200  localhost bluetoothd[459]: (CoreUtils) [com.apple.bluetooth:CBStackDeviceMonitor] \(laterACL)")
+        }
+        for child in [disconnect, connector] {
+            for _ in 0..<600 {
+                _ = try child.readLines()
+                child.reap()
+                if child.finished { break }
+                usleep(5_000)
+            }
+        }
+        session.lock.withLock { session.recoveryRequested = true }
+        try session.beginRestore()
+        if laterACL == nil {
+            try require(session.children["restore-disconnect"] != nil && !session.ownedACLEnded,
+                "The session refused to disconnect its own ACL")
+        } else {
+            try require(session.children["restore-disconnect"] == nil && session.ownedACLEnded,
+                "restore-disconnect targeted a connection that replaced the owned ACL")
+        }
+        for value in session.children.values { value.closeInput() }
+        print("PASS actual session restore-disconnect ownership laterACL=\(laterACL ?? "none")")
+    }
 }
 
 extension LDACNativeSession {
@@ -739,6 +778,9 @@ enum LDACSessionClosureCheck {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         for handle in [nil, 0, 1] as [Int?] {
             try LDACNativeSession.checkRestoreArguments(executable: executable, handle: handle)
+        }
+        for laterACL in [nil, "ACL disconnected: 02:00:00:00:00:01, result 0, reason 10722", "ACL connected: 02:00:00:00:00:01, result 0"] {
+            try LDACNativeSession.checkRestoreOwnership(executable: executable, laterACL: laterACL)
         }
         for failure in 1...3 {
             PipeSetupCheck.failureCall = failure
