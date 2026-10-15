@@ -7,7 +7,7 @@ extension SonyDeviceCoordinator {
         guard !isRunning else { return }
         isRunning = true
         isSystemSleeping = false
-        reportBluetoothAuthorization(CBManager.authorization)
+        reportBluetoothAuthorization(refreshBluetoothAuthorization())
         bluetoothAuthorizationManager = CBCentralManager(delegate: self, queue: .main,
             options: [CBCentralManagerOptionShowPowerAlertKey: false])
     }
@@ -23,6 +23,7 @@ extension SonyDeviceCoordinator {
         isDiscovering = false
         discoveryTimer?.invalidate()
         discoveryTimer = nil
+        stopInventoryNotifications()
         for controller in controllers { controller.stop() }
     }
 
@@ -50,6 +51,7 @@ extension SonyDeviceCoordinator {
         isDiscovering = false
         discoveryTimer?.invalidate()
         discoveryTimer = nil
+        stopInventoryNotifications()
         for controller in controllers { controller.systemWillSleep() }
     }
 
@@ -64,7 +66,7 @@ extension SonyDeviceCoordinator {
 
     func refreshDiscovery() {
         guard isRunning, !isSystemSleeping, !isDiscovering else { return }
-        let authorization = CBManager.authorization
+        let authorization = refreshBluetoothAuthorization()
         reportBluetoothAuthorization(authorization)
         guard authorization == .allowedAlways else { return }
         isDiscovering = true
@@ -75,11 +77,14 @@ extension SonyDeviceCoordinator {
                 guard let self, self.isRunning, !self.isSystemSleeping,
                       self.discoveryGeneration == generation else { return }
                 self.isDiscovering = false
+                self.cachedBluetoothAuthorization = authorization
                 self.reportBluetoothAuthorization(authorization)
                 guard authorization == .allowedAlways else { return }
+                self.startInventoryNotifications()
                 self.refreshPairedInventory()
+                // Respaldo para los cambios que IOBluetooth no notifica (por ejemplo, el multipunto).
                 self.discoveryTimer?.invalidate()
-                self.discoveryTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                self.discoveryTimer = Timer.scheduledTimer(withTimeInterval: Self.inventoryBackupInterval, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.refreshPairedInventory() }
                 }
             }
@@ -109,6 +114,7 @@ extension SonyDeviceCoordinator {
                 }
                 controller.systemDidWake()
                 controller.start()
+                controller.setPollingActive(connected.contains(controller.address))
             } else if retiredControllerAddresses.insert(controller.address).inserted {
                 controller.stop()
             }
@@ -118,8 +124,53 @@ extension SonyDeviceCoordinator {
         #endif
     }
 
-    func refreshPairedInventory(authorization: CBManagerAuthorization = CBManager.authorization) {
+    /// Intervalo del sondeo de respaldo del inventario; el día a día lo cubren las notificaciones de IOBluetooth.
+    static let inventoryBackupInterval: TimeInterval = 30
+
+    /// Relee la autorización de Bluetooth (IPC a TCC) y la deja en la caché.
+    @discardableResult
+    func refreshBluetoothAuthorization() -> CBManagerAuthorization {
+        cachedBluetoothAuthorization = CBManager.authorization
+        return cachedBluetoothAuthorization
+    }
+
+    func startInventoryNotifications() {
+        guard connectNotification == nil else { return }
+        connectNotification = IOBluetoothDevice.register(forConnectNotifications: self,
+                                                         selector: #selector(bluetoothDeviceConnected(_:device:)))
+    }
+
+    func stopInventoryNotifications() {
+        connectNotification?.unregister()
+        connectNotification = nil
+        for notification in disconnectNotifications.values { notification.unregister() }
+        disconnectNotifications = [:]
+    }
+
+    @objc func bluetoothDeviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        watchDisconnection(of: device)
+        refreshPairedInventory()
+    }
+
+    @objc func bluetoothDeviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        if let address = device.addressString.flatMap(SonyBLEIdentity.normalizedAddress) {
+            disconnectNotifications.removeValue(forKey: address)?.unregister()
+        }
+        refreshPairedInventory()
+    }
+
+    private func watchDisconnection(of device: IOBluetoothDevice) {
+        guard connectNotification != nil, let address = device.addressString.flatMap(SonyBLEIdentity.normalizedAddress),
+              disconnectNotifications[address] == nil,
+              let notification = device.register(forDisconnectNotification: self,
+                                                 selector: #selector(bluetoothDeviceDisconnected(_:device:))) else { return }
+        disconnectNotifications[address] = notification
+    }
+
+    /// Sin `authorization` usa la caché; un valor explícito es para quien acaba de leerla.
+    func refreshPairedInventory(authorization: CBManagerAuthorization? = nil) {
         guard isRunning, !isSystemSleeping else { return }
+        let authorization = authorization ?? cachedBluetoothAuthorization
         guard authorization == .allowedAlways else {
             reportBluetoothAuthorization(authorization)
             return
@@ -142,7 +193,10 @@ extension SonyDeviceCoordinator {
                 model = identity.model
             }
             guard let descriptor = SonyConnectedDevice(address: address, name: device.name ?? model.name, model: model) else { return nil }
-            if device.isClassicConnected() { connected.insert(address) }
+            if device.isClassicConnected() {
+                connected.insert(address)
+                watchDisconnection(of: device)
+            }
             return descriptor
         }
         reconcileDiscoveredDevices(devices, connectedAddresses: connected, pairedDeviceInventory: paired)
@@ -152,6 +206,6 @@ extension SonyDeviceCoordinator {
 extension SonyDeviceCoordinator: @preconcurrency CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard central === bluetoothAuthorizationManager, isRunning, !isSystemSleeping else { return }
-        if reportBluetoothAuthorization(CBManager.authorization) { refreshDiscovery() }
+        if reportBluetoothAuthorization(refreshBluetoothAuthorization()) { refreshDiscovery() }
     }
 }

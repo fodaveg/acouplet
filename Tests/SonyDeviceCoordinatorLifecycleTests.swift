@@ -367,6 +367,35 @@ final class SonyDeviceCoordinatorLifecycleTests: XCTestCase {
         }
     }
 
+    func testInventoryRefreshUsesCachedAuthorizationInsteadOfAskingTCC() throws {
+        let devices = makeCoordinator()
+        defer { devices.stop() }
+        devices.isRunning = true
+        devices.reconcileDiscoveredDevices([earbuds], connectedAddresses: [earbuds.address])
+        let controller = try XCTUnwrap(devices.controller(for: earbuds.address))
+        devices.cachedBluetoothAuthorization = .denied
+
+        devices.refreshPairedInventory()
+
+        XCTAssertTrue(controller.isBluetoothAccessDenied)
+        XCTAssertEqual(SonyDeviceCoordinator.inventoryBackupInterval, 30)
+    }
+
+    func testIdleDisconnectedControllerCanPausePollingAndConnectedOneCannot() throws {
+        let devices = makeCoordinator()
+        defer { devices.stop() }
+        devices.isRunning = true
+        devices.reconcileDiscoveredDevices([earbuds], connectedAddresses: [earbuds.address])
+        let controller = try XCTUnwrap(devices.controller(for: earbuds.address))
+        XCTAssertFalse(controller.canPausePolling)
+        controller.simulateControlLoss()
+        // Una pausa solicitada sin temporizador en marcha no cambia nada y se puede revertir.
+        controller.setPollingActive(false)
+        XCTAssertFalse(controller.isPollingActive)
+        controller.setPollingActive(true)
+        XCTAssertFalse(controller.isPollingActive)
+    }
+
     private func makeCoordinator() -> SonyDeviceCoordinator {
         SonyDeviceCoordinator(fallbackController: SonyHeadphonesController(displayOnly: true)) { device in
             let controller = SonyHeadphonesController(startAutomatically: false, simulated: true,

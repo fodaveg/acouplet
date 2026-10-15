@@ -765,6 +765,9 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var recoveryUsesBLE: Bool?
     private var recoveryClassicAddress: String?
     private var refreshTimer: Timer?
+    /// El coordinador pidió parar el sondeo porque el dispositivo no está conectado; se reanuda al conectar.
+    private var isPollingPaused = false
+    private var isPollingRequested = true
     @Published private var bluetoothAuthorization: CBManagerAuthorization?
     private var isInitializingBluetooth = false
     private var bluetoothInitializationID: UUID?
@@ -1610,7 +1613,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
 
     func start(authorization: @escaping @Sendable () -> CBManagerAuthorization = { CBManager.authorization },
                initializeBluetooth: @escaping @Sendable () -> Void = { _ = IOBluetoothDevice.pairedDevices() }) {
-        guard !displayOnly, !isSystemSleeping, !isSimulated, refreshTimer == nil, !isInitializingBluetooth else { return }
+        guard !displayOnly, !isSystemSleeping, !isSimulated, refreshTimer == nil, !isPollingPaused, !isInitializingBluetooth else { return }
         isInitializingBluetooth = true
         bluetoothAuthorization = authorization()
         linkState = .searching
@@ -1639,7 +1642,44 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         isBluetoothInitialized = false
         refreshTimer?.invalidate()
         refreshTimer = nil
+        isPollingPaused = false
+        isPollingRequested = true
         systemWillSleep()
+    }
+
+    /// Sin enlace, transición, reintento ni tarea pendiente: el sondeo de 3 s no tiene nada que hacer.
+    var canPausePolling: Bool {
+        !hasOpenControlTransport && !isDeviceConnected && channel == nil && bleTransport == nil
+            && classicConnectionID == nil && retryWorkItem == nil && nextRetryDate == nil && recoveryUsesBLE == nil
+            && stage == .idle && powerOffState == nil && caseBatteryObservedAt == nil && !isInitializingBluetooth
+            && connectionTransition?.isFinished != false && multipointTransition?.isFinished != false
+            && earbudFinder?.isBusy != true && earbudFinder?.mayBeRinging != true
+    }
+
+    var isPollingActive: Bool { refreshTimer != nil }
+
+    /// Lo llama el coordinador con cada actualización del inventario: un dispositivo no conectado y en reposo
+    /// para su temporizador de 3 s, y al conectar se reanuda y sondea al momento.
+    func setPollingActive(_ active: Bool) {
+        isPollingRequested = active
+        if active {
+            guard isPollingPaused else { return }
+            isPollingPaused = false
+            guard isBluetoothInitialized, !isSimulated else { return }
+            startRefreshTimer()
+            poll()
+        } else if refreshTimer != nil, canPausePolling {
+            refreshTimer?.invalidate()
+            refreshTimer = nil
+            isPollingPaused = true
+        }
+    }
+
+    private func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
+        }
     }
 
     func reportBluetoothAuthorization(_ authorization: CBManagerAuthorization) {
@@ -1661,9 +1701,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         Self.logger.info("Bluetooth coordinator initialized")
         refresh(shouldOpenLink: reconnectAutomatically)
         guard !isSimulated else { return }
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.poll() }
+        if !isPollingRequested, canPausePolling {
+            isPollingPaused = true
+            return
         }
+        startRefreshTimer()
     }
 
     func setReconnectAutomatically(_ enabled: Bool) {
