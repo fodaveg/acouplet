@@ -80,6 +80,23 @@ struct MenuBarView: View {
                 .scrollBounceBehavior(.basedOnSize)
                 .accessibilityIdentifier("headphones.controlsScroll")
             }
+            ForEach(devicesNeedingConfirmation, id: \.address) { controller in
+                Divider()
+                Button {
+                    dismissMenu()
+                    devices.selectForWorkflow(address: controller.address)
+                    settings.selectedSettingsPane = "headphones"
+                    showSettings()
+                } label: {
+                    Label("\(controller.deviceName) Needs Confirmation…", systemImage: "exclamationmark.bubble")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderless)
+                .tint(nil)
+                .accessibilityIdentifier("menu.otherDeviceConfirmation")
+            }
             #if !ACOUPLET_PUBLIC_APIS_ONLY
             if needsLDACDriverUpdate, !showsLDACControl {
                 Divider()
@@ -150,6 +167,14 @@ struct MenuBarView: View {
 
     private var showsHeadphoneControls: Bool {
         headphones.isReady && headphones.powerOffState == nil && !headphones.headphoneTestNeedsRecovery
+    }
+
+    /// Headphones other than the selected ones that are waiting for a confirmation. Their alert no longer
+    /// switches the selection or opens Settings by itself (decision D14).
+    private var devicesNeedingConfirmation: [SonyHeadphonesController] {
+        devices.controllers.filter {
+            $0 !== headphones && ($0.connectionTransition?.alert != nil || $0.multipointTransition?.alert != nil)
+        }
     }
 
     private var showsConnectOnly: Bool {

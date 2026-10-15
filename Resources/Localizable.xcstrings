@@ -16857,6 +16857,57 @@
           }
         }
       }
+    },
+    "%@ needs your confirmation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ needs your confirmation"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ onayınızı bekliyor"
+          }
+        }
+      }
+    },
+    "Open Acouplet from the menu bar to respond.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Acouplet from the menu bar to respond."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yanıtlamak için menü çubuğundan Acouplet’i açın."
+          }
+        }
+      }
+    },
+    "%@ Needs Confirmation…": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Needs Confirmation…"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Onay Bekliyor…"
+          }
+        }
+      }
     }
   },
   "version": "1.1"

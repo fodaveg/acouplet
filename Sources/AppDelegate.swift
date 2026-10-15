@@ -420,6 +420,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .removeDuplicates()
                 .sink { [weak self, weak controller] needsConfirmation in
                     guard needsConfirmation, let self, let controller else { return }
+                    guard controller === self.environment.devices.selectedController else {
+                        // Other headphones neither take the selection nor the focus (decision D14): a notice says
+                        // so, and the panel offers to open Settings for them.
+                        #if !ACOUPLET_PUBLIC_APIS_ONLY
+                        _ = self.environment.noiseModeHUD.showConfirmationRequest(headphones: controller)
+                        #endif
+                        return
+                    }
                     self.environment.devices.selectForWorkflow(address: controller.address)
                     self.showSettings()
                 }
