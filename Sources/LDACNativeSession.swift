@@ -95,6 +95,24 @@ struct LDACPriorityCleanupError: LocalizedError, Sendable {
     var errorDescription: String? { message }
 }
 
+/// Internal switch for the A/B test of the Bluetooth playback priority (audit L7, decision D4).
+/// `defaults write dev.baglayan.Acouplet LDACPlaybackPriorityDisabled -bool true` makes the next
+/// LDAC session skip every priority request to the driver, and `defaults delete` with the same key
+/// restores it. The owner process is the app binary, so it reads the app's own domain.
+enum LDACPlaybackPriority {
+    static let disabledKey = "LDACPlaybackPriorityDisabled"
+
+    static func isDisabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: disabledKey)
+    }
+
+    /// Returns nil without calling `make` while the switch disables the priority.
+    static func control(in defaults: UserDefaults = .standard,
+                        _ make: () throws -> LDACPriorityControl?) rethrows -> LDACPriorityControl? {
+        isDisabled(in: defaults) ? nil : try make()
+    }
+}
+
 final class LDACNativeSession: @unchecked Sendable {
     private enum PriorityPhase {
         case unused, configuring, configured, stopping, uncertain, removing, removed
@@ -351,6 +369,9 @@ final class LDACNativeSession: @unchecked Sendable {
                 try launch("restore", executable: helpers.connection, arguments: ["--address", address, "--restore"])
                 restoreDeadline = DispatchTime.now() + 52
             } else {
+                if priority == nil {
+                    record("PRIORITY_SKIPPED disabledByDefaults=\(LDACPlaybackPriority.isDisabled() ? 1 : 0) key=\(LDACPlaybackPriority.disabledKey)")
+                }
                 try launch("preflight", executable: helpers.capture, arguments: ["--check-permission"] + captureDeviceArguments)
                 deadline = DispatchTime.now() + 90
             }
@@ -806,7 +827,9 @@ final class LDACNativeSession: @unchecked Sendable {
                     }
                     if state.phase == "configured" {
                         priorityPhase = .configured
-                        record("PRIORITY_CONFIGURATION_ATTEMPT_COMPLETED controllerAcknowledgment=0")
+                        // The driver reports "configured" after any post of the global
+                        // AdaptiveJitterBufferChanged notification; nothing ties it to this link.
+                        record("PRIORITY_CONFIGURATION_ATTEMPT_COMPLETED driverPhase=configured evidence=global-notification controllerAcknowledgment=unmeasured")
                     }
                 }
                 if priority == nil || priorityPhase == .configured {
@@ -966,7 +989,7 @@ final class LDACNativeSession: @unchecked Sendable {
             if let error = state.error { throw LDACSessionError(error) }
             if state.phase == "idle" {
                 priorityPhase = .removed
-                record("PRIORITY_CLEANUP_ATTEMPT_COMPLETED controllerAcknowledgment=0")
+                record("PRIORITY_CLEANUP_ATTEMPT_COMPLETED driverPhase=idle evidence=driver-phase controllerAcknowledgment=unmeasured")
             } else if state.phase == "cleanup-required" || DispatchTime.now() >= priorityDeadline {
                 throw LDACSessionError("Bluetooth playback priority cleanup could not be confirmed.")
             }
@@ -1465,10 +1488,44 @@ final class LDACNativeChild {
         return lines
     }
 
+    /// How long `send` waits for a helper to make room in its stdin pipe (audit L11). Commands are at
+    /// most 8 KiB and the pipe holds at least 16 KiB, so a helper that frees no space in this time is
+    /// stuck; the bound also caps how long a caller, possibly the main actor, can block.
+    static let sendTimeout = DispatchTimeInterval.milliseconds(500)
+
+    /// Writes one command line whole. The pipe is non-blocking, so the line goes out in as many
+    /// writes as it takes, waiting for POLLOUT up to `sendTimeout`. EPIPE still means the helper
+    /// exited, and EAGAIN that the pipe stayed full and nothing was written. A line that went out
+    /// only in part throws an error that says how much, because the helper now holds a partial
+    /// command.
     func send(_ line: String) throws {
         let data = Data((line + "\n").utf8)
-        let sent = data.withUnsafeBytes { Darwin.write(input, $0.baseAddress, data.count) }
-        guard sent == data.count else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EPIPE) }
+        let deadline = DispatchTime.now() + Self.sendTimeout
+        var written = 0
+        try data.withUnsafeBytes { bytes in
+            while written < data.count {
+                let count = Darwin.write(input, bytes.baseAddress! + written, data.count - written)
+                if count > 0 { written += count; continue }
+                let code = count < 0 ? errno : EAGAIN
+                if code == EINTR { continue }
+                if code == EPIPE { throw POSIXError(.EPIPE) }
+                if code != EAGAIN {
+                    if written == 0 { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+                    throw LDACSessionError("An audio helper command failed after \(written) of \(data.count) bytes (errno \(code)).")
+                }
+                let now = DispatchTime.now()
+                guard now < deadline else {
+                    if written == 0 { throw POSIXError(.EAGAIN) }
+                    throw LDACSessionError("An audio helper did not read its input: \(written) of \(data.count) bytes of a command were written.")
+                }
+                var descriptor = pollfd(fd: input, events: Int16(POLLOUT), revents: 0)
+                let milliseconds = (deadline.uptimeNanoseconds - now.uptimeNanoseconds + 999_999) / 1_000_000
+                if poll(&descriptor, 1, Int32(milliseconds)) < 0 && errno != EINTR {
+                    let pollError = errno
+                    throw LDACSessionError("An audio helper command could not be written: poll failed after \(written) of \(data.count) bytes (errno \(pollError)).")
+                }
+            }
+        }
     }
 
     func reap() {
