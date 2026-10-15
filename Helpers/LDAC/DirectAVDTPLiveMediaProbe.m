@@ -253,6 +253,25 @@ static const double DegradationLimit = 0.2;
 // A late sender skips PCM only from 200 ms on, below the 250 ms PCM reserve (prefill = rate / 4).
 // Up to there it catches up by sending without pacing.
 static const double PCMSkipLateness = 0.2;
+// Lateness only measures the sender when PCM is waiting in the ring. With the ring empty the source
+// sets the pace: build 105 at 96 kHz (session 08A81711) showed the capture delivering about 440 ppm
+// below the nominal rate, the ring at 512 frames, nothing to skip, and the 250 ms limit ending the
+// stream as a hard error. A continuous stream now moves its schedule to the source instead, and only
+// a source that delivers nothing for a whole second fails, as a recoverable source-stalled.
+static const double PCMSourceStallSeconds = 1;
+
+// How long the sender waits for the PCM block it needs. In a continuous stream the block is due when
+// its last sample should exist (`blockDue`) and the wait ends one stall period after that, or after
+// it began if the source was already behind. Fixed-length probe runs keep the strict 250 ms limit
+// past the packet's due time.
+static double SourceWaitLimit(BOOL continuous, double packetDue, double blockDue, double waitStart) {
+    return continuous ? fmax(blockDue, waitStart) + PCMSourceStallSeconds : packetDue + 0.25;
+}
+
+// How far the schedule moves once a waited-for block arrives: the time past its due, or nothing.
+static double SourceResync(BOOL continuous, double blockDue, double arrived) {
+    return continuous ? fmax(0, arrived - blockDue) : 0;
+}
 
 typedef struct {
     double bucketEnd;
@@ -335,6 +354,27 @@ static BOOL RecoveryChecks(void) {
     degradation = NewDegradation(10, 48000, 0);
     passed &= !RecordDegradation(&degradation, 10.5, second - 8) && !RecordDegradation(&degradation, 1000000.5, second - 8 + skip);
     passed &= DegradationWindowBytes(&degradation) == skip && degradation.bucketEnd > 1000000.5 && degradation.bucketEnd <= 1000001.5;
+    // A continuous stream waits for its source up to one stall period past the block's due time, or
+    // past the start of the wait when the source is already behind; a probe run keeps the 250 ms limit.
+    passed &= SourceWaitLimit(YES, 10, 10.005, 9.9) == 11.005 && SourceWaitLimit(YES, 10, 10.005, 10.3) == 11.3;
+    passed &= SourceWaitLimit(NO, 10, 10.005, 9.9) == 10.25;
+    // A late block moves the schedule by its lateness; an early one, or a probe run, does not.
+    passed &= fabs(SourceResync(YES, 10.005, 10.2) - 0.195) < 1e-12 && SourceResync(YES, 10.005, 10) == 0 &&
+        SourceResync(NO, 10.005, 10.2) == 0;
+    // Build 105, 96 kHz (08A81711): the source ran 200 ms behind, about 180 ppm slow, and a 45 ms
+    // capture hiccup at the end took the fixed schedule past 250 ms, a hard failure. Following the
+    // source, no block comes near the stall limit and the schedule absorbs the whole deficit.
+    double paceStart = 0, fixedLate = 0, worstWait = -INFINITY, previousArrival = 0;
+    for (uint64_t block = 0; block < 45 * 96000 / 128; block++) {
+        double nominal = (double)(block + 1) * 128 / 96000;
+        double arrived = 0.2 + nominal * (1 + 180e-6) + (block >= 44 * 96000 / 128 ? 0.045 : 0);
+        double blockDue = paceStart + nominal;
+        fixedLate = fmax(fixedLate, arrived - nominal);
+        worstWait = fmax(worstWait, arrived - SourceWaitLimit(YES, blockDue, blockDue, previousArrival));
+        paceStart += SourceResync(YES, blockDue, arrived);
+        previousArrival = arrived;
+    }
+    passed &= fixedLate > 0.25 && worstWait < -0.75 && paceStart > 0.25 && paceStart < 0.26;
     return passed;
 }
 
@@ -1234,6 +1274,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     BOOL limitStopped = NO;
     double lastLatenessAt = 0;
     double started = 0;
+    double sourceResync = 0;
     do {
         if (probe.closed || probe.failed || fd < 0) break;
         int socketType = 0;
@@ -1261,6 +1302,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         printf("SOCKET fd=%d CID=%04X outgoingMTU=%u type=%d baseline=%d\n",
                fd, owned.cid, owned.outgoingMTU, socketType, baseline);
         started = MonotonicTime();
+        // Packets are due at paceStart + timestamp / rate; paceStart moves later when the source falls behind.
+        double paceStart = started;
         probe.degradation = NewDegradation(started, profile.sampleRate, probe.pcmSkippedBytes);
         double deadline = continuous ? INFINITY : started + seconds + 1;
         double nextProgress = started + 1;
@@ -1290,18 +1333,18 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 break;
             }
             probe.pcmCanSkip = !finishing && sourceSamples == generatedSamples;
-            double due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+            double due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
             if (continuous && !finishing && probe.pcmCanSkip) {
                 uint64_t previousSkipped = probe.pcmSkippedBytes;
                 RecordSenderStage(&timing, SenderPCM);
                 [probe pollPCM];
                 RecordSenderStage(&timing, SenderOther);
                 double now = MonotonicTime();
-                due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+                due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                 if (probe.pcmSkippedBytes != previousSkipped || now - due >= 0.1) RecordBreach(&recovery, now);
                 if (now - due >= PCMSkipLateness) {
                     NSUInteger skipped = [probe discardPCMFrames:(uint64_t)fmin((now - due) * profile.sampleRate, profile.sampleRate)];
-                    due = PacketDue(started, generatedSamples + probe.pcmSkippedBytes / 8, profile);
+                    due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                     if (skipped) printf("PCM_RECOVERY skippedFrames=%lu nextTimestamp=%llu late=%.6f strictPass=0\n",
                                         skipped, generatedSamples + probe.pcmSkippedBytes / 8, now - due);
                 }
@@ -1311,8 +1354,13 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 NSUInteger requiredBytes = inputFrames * 8;
                 adaptiveSourceReady &= probe.pcmBytes >= requiredBytes;
                 BOOL underflowBreached = NO;
+                BOOL sourceWait = probe.pcmBytes < requiredBytes;
+                double waitStart = MonotonicTime();
+                double blockDue = PacketDue(paceStart, sourceSamples + inputFrames + probe.pcmSkippedBytes / 8, profile);
+                double waitDue = continuous ? blockDue : due;
+                double waitLimit = SourceWaitLimit(continuous, due, blockDue, waitStart);
                 while (probe.pcmBytes < requiredBytes && !probe.closed && !probe.failed && !probe.inputEnded && !probe.stopRequested &&
-                       MonotonicTime() < due + 0.25 && MonotonicTime() < deadline) {
+                       MonotonicTime() < waitLimit && MonotonicTime() < deadline) {
                     RecordSenderStage(&timing, SenderControl);
                     PollLiveControls(probe);
                     RecordSenderStage(&timing, SenderInput);
@@ -1321,7 +1369,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     [probe pollPCM];
                     RecordSenderStage(&timing, SenderOther);
                     double now = MonotonicTime();
-                    if (probe.pcmBytes < requiredBytes && now - due >= 0.1 && !underflowBreached) {
+                    if (probe.pcmBytes < requiredBytes && now - waitDue >= 0.1 && !underflowBreached) {
                         underflowBreached = YES;
                         BOOL first = RecordBreach(&recovery, now);
                         double pollAt = MonotonicTime();
@@ -1329,7 +1377,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                         int pollError = count < 0 ? errno : 0;
                         now = MonotonicTime();
                         printf("PCM_BREACH sourceSamples=%llu late=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
-                               sourceSamples, now - due, first, lastPollAt - started, pollAt - lastPollAt, now - pollAt,
+                               sourceSamples, now - waitDue, first, lastPollAt - started, pollAt - lastPollAt, now - pollAt,
                                lastPollCount, lastPollFlags, lastPollData, count, count > 0 ? event.flags : 0,
                                count > 0 ? (long)event.data : 0, pollError);
                         PrintSchedulerSample("PCM_BREACH", (long)sentPackets, probe.schedulerBaseline);
@@ -1351,7 +1399,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 if (probe.stopRequested) continue;
                 if (probe.pcmBytes < requiredBytes || probe.closed || probe.failed || probe.inputEnded) {
                     limitStopped = !probe.closed && !probe.failed && !probe.inputEnded;
-                    if (limitStopped) {
+                    if (limitStopped && continuous) {
+                        // The capture has delivered nothing for a whole stall period: end the stream
+                        // as a recoverable failure, which the session restarts, not a hard error.
+                        limitStopped = NO;
+                        probe.failed = YES;
+                        printf("PCM_FAILED reason=source-stalled waitedSeconds=%.6f stallSeconds=%.3f sourceSamples=%llu bufferedFrames=%lu sourceResync=%.6f\n",
+                               MonotonicTime() - waitStart, PCMSourceStallSeconds, sourceSamples, probe.pcmBytes / 8, sourceResync);
+                    } else if (limitStopped) {
                         double pollAt = MonotonicTime();
                         int count = kevent(queue, NULL, 0, &event, 1, &immediate);
                         double now = MonotonicTime();
@@ -1364,6 +1419,12 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     printf("PCM_UNDERFLOW sourceSamples=%llu bufferedBytes=%lu late=%.6f limitStopped=%d\n",
                            sourceSamples, probe.pcmBytes, MonotonicTime() - due, limitStopped);
                     break;
+                }
+                double resync = sourceWait ? SourceResync(continuous, blockDue, MonotonicTime()) : 0;
+                if (resync > 0) {
+                    paceStart += resync;
+                    sourceResync += resync;
+                    due = PacketDue(paceStart, generatedSamples + probe.pcmSkippedBytes / 8, profile);
                 }
                 BOOL wasRamping = probe.gainRampRemaining > 0;
                 double currentGain = probe.gain;
@@ -1545,10 +1606,10 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     probe.gainAckReady = NO;
                 }
                 if (now >= nextProgress) {
-                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu\n",
+                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f\n",
                            sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
                            lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
-                           sentRTPSamples);
+                           sentRTPSamples, sourceResync);
                     nextProgress = now + 1;
                 }
                 if (profile.adaptive && !finishing && !probe.stopRequested) {
@@ -1595,13 +1656,14 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     if (probe.closed || probe.failed || probe.inputEnded) result = 5;
     double recoveryObserved = recovery.breached ? fmax(0, lastLatenessAt - recovery.firstBreach) : 0;
     int recoveredWithinOneSecond = recovery.recovered ? 1 : (recovery.breached && recoveryObserved >= 1 ? 0 : -1);
-    printf("FEED_COMPLETE result=%d strictPass=%d sentPackets=%lu drainedPackets=%lu sentBytes=%lu sentSamples=%llu drainedSamples=%llu sourceSamples=%llu generatedSamples=%llu targetSamples=%llu pcmReadBytes=%llu pcmDiscardedBytes=%llu bufferedFrames=%lu elapsed=%.6f closed=%d firstBreachElapsed=%.6f recoveredWithin1s=%d recoveryObservedSeconds=%.6f recoveryElapsed=%.6f limitStopped=%d skippedFrames=%llu rtpSamples=%llu paddingSamples=%llu\n",
+    printf("FEED_COMPLETE result=%d strictPass=%d sentPackets=%lu drainedPackets=%lu sentBytes=%lu sentSamples=%llu drainedSamples=%llu sourceSamples=%llu generatedSamples=%llu targetSamples=%llu pcmReadBytes=%llu pcmDiscardedBytes=%llu bufferedFrames=%lu elapsed=%.6f closed=%d firstBreachElapsed=%.6f recoveredWithin1s=%d recoveryObservedSeconds=%.6f recoveryElapsed=%.6f limitStopped=%d skippedFrames=%llu rtpSamples=%llu paddingSamples=%llu sourceResync=%.6f\n",
            result, result == 0 && !recovery.breached && !probe.pcmSkippedBytes, sentPackets, drainedPackets, sentBytes, sentSamples, drainedSamples,
            sourceSamples, generatedSamples, targetSamples, probe.pcmReadBytes, probe.pcmDiscardedBytes, probe.pcmBytes / 8,
            started ? MonotonicTime() - started : 0, probe.closed,
            recovery.breached ? recovery.firstBreach - started : -1, recoveredWithinOneSecond, recoveryObserved,
            recovery.recovered ? recovery.recoveryTime - recovery.firstBreach : -1, limitStopped,
-           probe.pcmSkippedBytes / 8, sentRTPSamples, generatedSamples >= sourceSamples ? generatedSamples - sourceSamples : 0);
+           probe.pcmSkippedBytes / 8, sentRTPSamples, generatedSamples >= sourceSamples ? generatedSamples - sourceSamples : 0,
+           sourceResync);
     if (realtimeStatus == KERN_SUCCESS) printf("REALTIME_POLICY_RELEASED status=%d\n", ReleaseSenderRealtime());
     [NSProcessInfo.processInfo endActivity:activity];
     return result == 0;

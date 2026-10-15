@@ -678,6 +678,9 @@ final class LDACNativeSession: @unchecked Sendable {
                 if line.hasPrefix("PCM_FAILED reason=persistent-degradation ") {
                     if !shouldStop { connectionLost(String(localized: "The Bluetooth connection couldn’t keep up. Ordinary Bluetooth audio is being restored.")) }
                     else if !recoverableFailure { failForUser(String(localized: "LDAC stopped because the Bluetooth connection couldn’t keep up.")) }
+                } else if line.hasPrefix("PCM_FAILED reason=source-stalled ") {
+                    // The capture delivered nothing for a second; a new session starts a new capture.
+                    if !shouldStop { connectionLost(String(localized: "LDAC playback stopped unexpectedly. Try again.")) }
                 } else {
                     fail(line)
                 }
