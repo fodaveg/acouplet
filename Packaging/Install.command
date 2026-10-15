@@ -557,6 +557,16 @@ else
 fi
 print "Background access is managed in System Settings > General > Login Items & Extensions."
 if [[ -f "$installed_app/Contents/Resources/Acouplet LDAC Output.pkg" ]]; then
-    print "Enable LDAC in the app to authorize its bundled driver installation."
-    print "Restart the Mac to activate the driver. This app installer did not install it or restart Core Audio."
+    # The app compares its bundled driver with the installed and loaded ones; only it can read the loaded revision.
+    driver_state="$("$installed_executable" --ldac-driver-state 2>/dev/null || true)"
+    case "$driver_state" in
+        current) print "The LDAC audio driver is already up to date; no restart is needed." ;;
+        restartRequired) print "The LDAC audio driver is installed. Restart the Mac to activate it." ;;
+        outdated) print "This version includes a newer LDAC audio driver. Use Update LDAC Driver in the app, then restart the Mac to activate it." ;;
+        missing) print "To use LDAC, turn it on in the app to install its audio driver, then restart the Mac to activate it." ;;
+        *) print "The LDAC audio driver could not be checked. Open the app's LDAC settings for details." ;;
+    esac
+    if [[ "$driver_state" != current ]]; then
+        print "This app installer did not install the driver or restart Core Audio."
+    fi
 fi

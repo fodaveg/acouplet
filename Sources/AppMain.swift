@@ -10,12 +10,30 @@ enum AcoupletMain {
             LDACOwnerWorker.run()
             return
         }
+        if CommandLine.arguments == [CommandLine.arguments[0], "--ldac-driver-state"] {
+            print(ldacDriverStateKeyword(LDACDriverInstaller.inspect()))
+            exit(EXIT_SUCCESS)
+        }
         #endif
         if let status = SettingsStore.runLoginItemCommand(CommandLine.arguments) {
             exit(status)
         }
         AcoupletApp.main()
     }
+
+    #if !ACOUPLET_PUBLIC_APIS_ONLY
+    /// The word that `--ldac-driver-state` prints for Install.command, which tells the user whether the
+    /// LDAC driver needs installing, updating or a restart, using the same checks as the app.
+    static func ldacDriverStateKeyword(_ state: LDACDriverInstaller.State) -> String {
+        switch state {
+        case .missing: "missing"
+        case .outdated: "outdated"
+        case .restartRequired: "restartRequired"
+        case .current: "current"
+        case .unavailable: "unavailable"
+        }
+    }
+    #endif
 }
 
 @MainActor

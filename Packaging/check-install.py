@@ -143,7 +143,12 @@ elif name == 'launchctl':
     else:
         raise AssertionError('Unexpected launchctl command: ' + str(args))
 elif name in ('Acouplet', 'XM5 Control'):
-    assert args == ['--unregister-login-item'] or name == 'Acouplet' and args == ['--register-login-item'], args
+    assert args == ['--unregister-login-item'] or name == 'Acouplet' and args in (['--register-login-item'], ['--ldac-driver-state']), args
+    if args == ['--ldac-driver-state']:
+        driver_state = (root / 'driver-state').read_text() if (root / 'driver-state').exists() else 'missing'
+        if driver_state == 'fail': sys.exit(1)
+        print(driver_state)
+        sys.exit(0)
     if mode == 'helper-failure' and name == 'Acouplet': sys.exit(19)
     if mode == 'legacy-helper-failure' and name == 'XM5 Control': sys.exit(19)
     if name == 'Acouplet':
@@ -487,6 +492,25 @@ for scenario in ('running', 'running-release-changed', 'local-stopped', 'local-r
         assert (root / 'Preferences/dev.baglayan.Acouplet.plist').read_text() == 'preserve'
         print('require-stopped-' + scenario + ': passed')
 
+
+for driver_state, message in (('current', 'already up to date; no restart is needed'),
+                              ('restartRequired', 'The LDAC audio driver is installed. Restart the Mac to activate it.'),
+                              ('outdated', 'includes a newer LDAC audio driver. Use Update LDAC Driver in the app'),
+                              ('missing', 'turn it on in the app to install its audio driver'),
+                              ('unavailable', 'could not be checked'), ('fail', 'could not be checked')):
+    with tempfile.TemporaryDirectory(prefix='acouplet-driver-message-check-') as directory:
+        root = Path(directory)
+        fixture(root, 'success')
+        driver_installer = root / 'package/Acouplet.app/Contents/Resources/Acouplet LDAC Output.pkg'
+        driver_installer.parent.mkdir(parents=True)
+        driver_installer.write_text('fixture')
+        (root / 'driver-state').write_text(driver_state)
+        result = run(root, 'success')
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert message in result.stdout, (driver_state, result.stdout)
+        assert ('restart the mac' in result.stdout.lower()) == (driver_state not in ('current', 'unavailable', 'fail')), result.stdout
+        assert ('did not install the driver' in result.stdout) == (driver_state != 'current'), result.stdout
+        print('driver-message-' + driver_state + ': passed')
 
 for scenario in ('pane-success', 'pane-legacy-target', 'pane-foreign-target', 'pane-symlink-target', 'pane-bad-signature', 'pane-stage-failure', 'pane-commit-failure', 'pane-foreign-prototype'):
     with tempfile.TemporaryDirectory(prefix='acouplet-pane-install-check-') as directory:
