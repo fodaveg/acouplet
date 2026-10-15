@@ -813,8 +813,13 @@ struct ConnectedHeadphonePicker: View {
             get: { devices.selectedAddress },
             set: { if let address = $0 { devices.select(address: address) } }
         )) {
-            if let address = devices.selectedAddress, !devices.selectableDevices.contains(where: { $0.address == address }) {
-                Text(devices.selectedController.deviceName).tag(Optional(address)).disabled(true)
+            if let address = devices.selectedAddress {
+                if !devices.selectableDevices.contains(where: { $0.address == address }) {
+                    Text(devices.selectedController.deviceName).tag(Optional(address)).disabled(true)
+                }
+            } else {
+                // Sin dispositivo seleccionado (por ejemplo, mientras se reinicia el estado) la selección es nil.
+                Text(devices.selectedController.deviceName).tag(String?.none).disabled(true)
             }
             ForEach(devices.connectedDevices) { device in
                 Text(Self.title(for: device, among: devices.selectableDevices))
