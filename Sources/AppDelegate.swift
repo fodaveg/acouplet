@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var testTerminationObserver: AnyCancellable?
     private var isDuplicateLaunch = false
     private var pendingSettingsRequest = false
+    var hasRegisteredNavigation = false
     var openSettings: (() -> Void)? {
         didSet {
             if pendingSettingsRequest, openSettings != nil {

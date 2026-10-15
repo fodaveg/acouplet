@@ -136,7 +136,11 @@ struct AcoupletApp: App {
         return paths
     }
 
+    /// Hands the scene's Settings and window actions to the app delegate and App Intents. SwiftUI evaluates
+    /// `body` many times, so this registers only on the first evaluation (G15).
     private func registerNavigation() {
+        guard !appDelegate.hasRegisteredNavigation else { return }
+        appDelegate.hasRegisteredNavigation = true
         appDelegate.openSettings = { openSettings() }
         if #available(macOS 27.0, *) {
             let navigation = HeadphoneIntentNavigation { [appDelegate, openWindow] destination in
