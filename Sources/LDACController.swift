@@ -42,7 +42,7 @@ final class LDACController: ObservableObject {
         }
     }
 
-    /// EXPERIMENTAL: tells the Sony controller to skip periodic settings reads while LDAC streams.
+    /// Tells the Sony controller to reduce its periodic reads to a battery poll while LDAC streams.
     private func syncStreamingFlag() {
         if case .active = state { headphones?.isLDACStreaming = true } else { headphones?.isLDACStreaming = false }
     }
