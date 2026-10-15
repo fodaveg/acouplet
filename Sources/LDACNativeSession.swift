@@ -1469,10 +1469,44 @@ final class LDACNativeChild {
         return lines
     }
 
+    /// How long `send` waits for a helper to make room in its stdin pipe (audit L11). Commands are at
+    /// most 8 KiB and the pipe holds at least 16 KiB, so a helper that frees no space in this time is
+    /// stuck; the bound also caps how long a caller, possibly the main actor, can block.
+    static let sendTimeout = DispatchTimeInterval.milliseconds(500)
+
+    /// Writes one command line whole. The pipe is non-blocking, so the line goes out in as many
+    /// writes as it takes, waiting for POLLOUT up to `sendTimeout`. EPIPE still means the helper
+    /// exited, and EAGAIN that the pipe stayed full and nothing was written. A line that went out
+    /// only in part throws an error that says how much, because the helper now holds a partial
+    /// command.
     func send(_ line: String) throws {
         let data = Data((line + "\n").utf8)
-        let sent = data.withUnsafeBytes { Darwin.write(input, $0.baseAddress, data.count) }
-        guard sent == data.count else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EPIPE) }
+        let deadline = DispatchTime.now() + Self.sendTimeout
+        var written = 0
+        try data.withUnsafeBytes { bytes in
+            while written < data.count {
+                let count = Darwin.write(input, bytes.baseAddress! + written, data.count - written)
+                if count > 0 { written += count; continue }
+                let code = count < 0 ? errno : EAGAIN
+                if code == EINTR { continue }
+                if code == EPIPE { throw POSIXError(.EPIPE) }
+                if code != EAGAIN {
+                    if written == 0 { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+                    throw LDACSessionError("An audio helper command failed after \(written) of \(data.count) bytes (errno \(code)).")
+                }
+                let now = DispatchTime.now()
+                guard now < deadline else {
+                    if written == 0 { throw POSIXError(.EAGAIN) }
+                    throw LDACSessionError("An audio helper did not read its input: \(written) of \(data.count) bytes of a command were written.")
+                }
+                var descriptor = pollfd(fd: input, events: Int16(POLLOUT), revents: 0)
+                let milliseconds = (deadline.uptimeNanoseconds - now.uptimeNanoseconds + 999_999) / 1_000_000
+                if poll(&descriptor, 1, Int32(milliseconds)) < 0 && errno != EINTR {
+                    let pollError = errno
+                    throw LDACSessionError("An audio helper command could not be written: poll failed after \(written) of \(data.count) bytes (errno \(pollError)).")
+                }
+            }
+        }
     }
 
     func reap() {

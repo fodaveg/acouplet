@@ -116,6 +116,56 @@ struct Check {
     descendant = int(result.stdout.split()[1])
     absent(descendant)
     print("PASS actual child launch/reap kills its isolated process group after supervisor SIGKILL; descendant stdout cannot retain the session")
+    sender_source = directory / "Sender.swift"
+    sender = directory / "Sender"
+    sender_source.write_text("import Foundation\nimport Darwin\n" + child_code + r'''
+@main
+struct Check {
+    static func main() throws {
+        let fixture = URL(fileURLWithPath: CommandLine.arguments[1])
+        let line = String(repeating: "x", count: 256 * 1024)
+        let bytes = line.utf8.count + 1
+        let counter = try LDACNativeChild(executable: URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "wc -c"], inheritedPCM: nil)
+        try counter.send(line)
+        counter.closeInput()
+        var counted: [String] = []
+        let countDeadline = DispatchTime.now() + 5
+        while !counter.outputEnded && DispatchTime.now() < countDeadline {
+            counted += try counter.readLines()
+            usleep(1000)
+        }
+        counter.wait()
+        precondition(counted.map { $0.trimmingCharacters(in: .whitespaces) } == ["\(bytes)"], "\(counted)")
+        let stalled = try LDACNativeChild(executable: fixture, arguments: [], inheritedPCM: nil)
+        let started = DispatchTime.now()
+        do {
+            try stalled.send(line)
+            preconditionFailure("A helper that never reads accepted a whole oversized line")
+        } catch let error as POSIXError {
+            preconditionFailure("A partial write was reported as POSIX error \(error.code.rawValue)")
+        } catch {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
+            precondition(elapsed >= 0.4 && elapsed < 3, "\(elapsed)")
+            precondition(error.localizedDescription.contains(" of \(bytes) bytes"), error.localizedDescription)
+        }
+        stalled.signal(SIGKILL)
+        stalled.wait()
+        let exited = try LDACNativeChild(executable: fixture, arguments: ["--exit-23"], inheritedPCM: nil)
+        exited.wait()
+        do {
+            try exited.send("stop")
+            preconditionFailure("A write to an exited helper succeeded")
+        } catch let error as POSIXError {
+            precondition(error.code == .EPIPE, "\(error.code)")
+        }
+        print("SENDER_CHECKS_PASSED")
+    }
+}
+''')
+    subprocess.run(["xcrun", "swiftc", "-swift-version", "6", "-parse-as-library", str(sender_source), "-o", str(sender)], check=True)
+    result = subprocess.run([str(sender), str(child)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0 and "SENDER_CHECKS_PASSED" in result.stdout, (result.returncode, result.stdout, result.stderr)
+    print("PASS actual child send: a 256 KiB line reaches a reading helper whole, a helper that never reads gets an explicit partial-write error after the bounded wait, and an exited helper is still EPIPE")
     result = subprocess.Popen([str(wrapper), "--exit-23"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     assert result.wait(timeout=5) == 23
     result.stdin.close()
