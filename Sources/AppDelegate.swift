@@ -9,15 +9,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var backgroundServiceMigrationError: String?
     private var retriesBackgroundServiceMigration = false
     private var isSystemTerminating = false
+    private var restartsAfterTermination = false
 
-    private static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
+    /// Asks the running copy whose process ID is the notification's object to open Settings.
+    static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
     private var globalHotKeyController: GlobalHotKeyController?
     private var menuBarController: MenuBarController?
+    private var preferencePaneServer: SonyPreferencePaneServer?
     private var cancellables = Set<AnyCancellable>()
     private var deviceAlertObservers: [ObjectIdentifier: AnyCancellable] = [:]
     private var testTerminationObserver: AnyCancellable?
     private var isDuplicateLaunch = false
     private var pendingSettingsRequest = false
+    var hasRegisteredNavigation = false
     var openSettings: (() -> Void)? {
         didSet {
             if pendingSettingsRequest, openSettings != nil {
@@ -69,14 +73,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        if CommandLine.arguments.contains("--unregister-login-item") {
-            environment.settings.setLaunchAtLogin(false)
-            if let error = environment.settings.launchAtLoginError {
-                print(error)
-                exit(EXIT_FAILURE)
-            }
-            exit(EXIT_SUCCESS)
-        }
         if !isRunningTests,
            let existing = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
             .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && $0.activationPolicy != .prohibited }) {
@@ -135,6 +131,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.retriesBackgroundServiceMigration = true
             NSApp.terminate(nil)
         }
+        environment.settings.restartApp = { [weak self] in
+            self?.restartsAfterTermination = true
+            NSApp.terminate(nil)
+        }
         menuBarController = MenuBarController(
             environment: environment,
             showSettings: { [weak self] in self?.showSettings() }
@@ -175,10 +175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launchType = NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue
         let isDefaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool == true
-        if !CommandLine.arguments.contains("--background-service"),
-           isDefaultLaunch || CommandLine.arguments.contains("--manual-launch"),
-           (!isRunningTests || CommandLine.arguments.contains("--manual-launch")),
-           launchType != keyAELaunchedAsLogInItem, launchType != keyAELaunchedAsServiceItem {
+        let isFirstLaunchOfBuild = !isRunningTests && environment.settings.consumeFirstLaunch(
+            ofBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String)
+        if isFirstLaunchOfBuild || !CommandLine.arguments.contains("--background-service")
+            && (isDefaultLaunch || CommandLine.arguments.contains("--manual-launch"))
+            && (!isRunningTests || CommandLine.arguments.contains("--manual-launch"))
+            && launchType != keyAELaunchedAsLogInItem && launchType != keyAELaunchedAsServiceItem {
             showSettings()
         }
         environment.devices.$controllers
@@ -191,12 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         environment.notifications.start()
-        environment.settings.$experimentalLDACEnabled
-            .removeDuplicates()
-            .sink { [weak self] enabled in
-                if enabled { self?.environment.ldac.updateInstalledDriverIfNeeded() }
-            }
-            .store(in: &cancellables)
+        // A newer bundled LDAC driver is offered in the panel (Update LDAC Driver); Installer.app opens only from there.
         #endif
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         workspaceNotifications.publisher(for: NSWorkspace.willPowerOffNotification)
@@ -217,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.environment.devices.systemDidWake() }
             .store(in: &cancellables)
         environment.devices.start()
+        startPreferencePaneServer()
         globalHotKeyController = GlobalHotKeyController { [weak self] in
             self?.environment.headphones.toggleNoiseControl()
         }
@@ -253,6 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: String(localized: "Cancel"))
             guard alert.runModal() == .alertFirstButtonReturn else {
                 isSystemTerminating = false
+                restartsAfterTermination = false
                 return .terminateCancel
             }
             retriesBackgroundServiceMigration = true
@@ -315,6 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.environment.devices.cancelTermination()
                     self?.retriesBackgroundServiceMigration = false
                     self?.isSystemTerminating = false
+                    self?.restartsAfterTermination = false
                 }
                 sender.reply(toApplicationShouldTerminate: interrupted == nil && (self?.finishTermination() ?? .terminateNow) == .terminateNow)
             }
@@ -344,6 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 environment.settings.selectedSettingsPane = "general"
                 showSettings()
                 isSystemTerminating = false
+                restartsAfterTermination = false
                 return .terminateCancel
             }
         }
@@ -357,13 +358,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     #endif
 
+    /// Starts the local connection that the device preference panes read (decision D10).
+    ///
+    /// The server listens in this process's `~/tmp`, which is where the panes look only when the app runs in
+    /// its sandbox container. Outside the sandbox it starts only if device panes are installed, so it does
+    /// not create `~/tmp` in the home folder for nothing.
+    private func startPreferencePaneServer() {
+        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
+        let panes = getpwuid(getuid()).map { URL(fileURLWithPath: String(cString: $0.pointee.pw_dir))
+            .appending(path: "Library/PreferencePanes") }
+        let hasDevicePanes = panes.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) }?
+            .contains { $0.hasPrefix("Sony-") && $0.hasSuffix(".prefPane") } == true
+        guard sandboxed || hasDevicePanes else { return }
+        let server = SonyPreferencePaneServer(devices: environment.devices)
+        do {
+            try server.start()
+            preferencePaneServer = server
+        } catch {
+            NSLog("The device preference panes cannot connect: %@", error.localizedDescription)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        preferencePaneServer?.stop()
+        preferencePaneServer = nil
         menuBarController?.stop()
         menuBarController = nil
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         environment.noiseModeHUD.dismiss()
         #endif
         environment.devices.stop()
+        if restartsAfterTermination { relaunch() }
+    }
+
+    /// Opens the app again after this copy has finished terminating (G8).
+    ///
+    /// The background service exits with a failure status, which its KeepAlive (`SuccessfulExit = false`)
+    /// turns into a relaunch by launchd. A copy of its own asks `open` to start a new copy once this
+    /// process has exited, so the new one does not find this one still running and defer to it.
+    private func relaunch() {
+        if environment.settings.isBackgroundServiceProcess { exit(EX_TEMPFAIL) }
+        let reopen = Process()
+        reopen.executableURL = URL(fileURLWithPath: "/bin/sh")
+        reopen.arguments = ["-c", "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open -n \"$2\"",
+                            "acouplet-relaunch", String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
+        do {
+            try reopen.run()
+        } catch {
+            NSLog("Acouplet could not schedule its relaunch: %@", error.localizedDescription)
+        }
     }
 
     private func observeDeviceAlerts(_ controllers: [SonyHeadphonesController]) {
@@ -377,6 +420,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .removeDuplicates()
                 .sink { [weak self, weak controller] needsConfirmation in
                     guard needsConfirmation, let self, let controller else { return }
+                    guard controller === self.environment.devices.selectedController else {
+                        // Other headphones neither take the selection nor the focus (decision D14): a notice says
+                        // so, and the panel offers to open Settings for them.
+                        #if !ACOUPLET_PUBLIC_APIS_ONLY
+                        _ = self.environment.noiseModeHUD.showConfirmationRequest(headphones: controller)
+                        #endif
+                        return
+                    }
                     self.environment.devices.selectForWorkflow(address: controller.address)
                     self.showSettings()
                 }

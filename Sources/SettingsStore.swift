@@ -67,7 +67,15 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var backgroundServiceStatus: SMAppService.Status = .notRegistered
     @Published var backgroundServiceMigrationError: String?
     var retryBackgroundServiceMigration: (() -> Void)?
+    /// Quits and reopens the app, set by the app delegate. The language change needs it.
+    var restartApp: (() -> Void)?
+    /// Whether the app is installed with its LaunchAgent, read from the plist's real state rather than from
+    /// how this copy was started (decision D9). Settings then shows the service instead of Launch at login.
     var hasBackgroundService: Bool {
+        backgroundServiceStatus == .enabled || backgroundServiceStatus == .requiresApproval
+    }
+    /// Whether this process is the LaunchAgent's copy, which launchd starts with `--background-service`.
+    var isBackgroundServiceProcess: Bool {
         CommandLine.arguments.contains("--background-service")
     }
     @Published var globalShortcutEnabled: Bool {
@@ -95,6 +103,7 @@ final class SettingsStore: ObservableObject {
     private var isLoadingEqualizerDraft = false
 
     private let managesLaunchService: Bool
+    private var isRefreshingLaunchStatus = false
     private let preferencesDomain: String?
     private let languageAtLaunch: AppLanguage
 
@@ -120,14 +129,25 @@ final class SettingsStore: ObservableObject {
         reconnectAutomatically = defaults.object(forKey: Keys.reconnectAutomatically) == nil
             ? true
             : defaults.bool(forKey: Keys.reconnectAutomatically)
-        launchAtLogin = managesLaunchService && SMAppService.mainApp.status == .enabled
-        globalShortcutEnabled = defaults.object(forKey: Keys.globalShortcutEnabled) == nil
-            ? true
-            : defaults.bool(forKey: Keys.globalShortcutEnabled)
+        // Filled in by refreshLaunchStatus() below, off the main thread.
+        launchAtLogin = false
+        // Off unless turned on (decision D12): ⌥⌘A is exclusive system-wide. The value is stored only when
+        // someone flips the toggle, so a stored true is a deliberate choice and is kept.
+        globalShortcutEnabled = defaults.bool(forKey: Keys.globalShortcutEnabled)
         customEqualizerDraft = Self.decode(EqualizerSettings.self, from: defaults.data(forKey: Keys.customEqualizerDraft)) ?? .flat
         equalizerDraftsByDevice = Self.decode([String: EqualizerSettings].self, from: defaults.data(forKey: Keys.equalizerDraftsByDevice)) ?? [:]
         equalizerProfiles = Self.decode([SavedEqualizerProfile].self, from: defaults.data(forKey: Keys.equalizerProfiles)) ?? []
         refreshLaunchStatus()
+    }
+
+    /// Returns true the first time a build runs, and records it so later launches of that build return false.
+    ///
+    /// The background service opens Settings on that launch, so the app does not look closed after an
+    /// installation or update when no headphones are connected and its menu-bar icon is hidden.
+    func consumeFirstLaunch(ofBuild build: String?) -> Bool {
+        guard let build, !build.isEmpty, defaults.string(forKey: Keys.lastLaunchedBuild) != build else { return false }
+        defaults.set(build, forKey: Keys.lastLaunchedBuild)
+        return true
     }
 
     func setAppLanguage(_ language: AppLanguage) {
@@ -176,22 +196,73 @@ final class SettingsStore: ObservableObject {
         isLoadingEqualizerDraft = false
     }
 
+    /// Reads the LaunchAgent's and the login item's state in the background and publishes them on the main
+    /// actor. Each read is a synchronous XPC call of about 15 ms, and Settings asks again every time it
+    /// appears or becomes active.
     func refreshLaunchStatus() {
-        guard managesLaunchService, let user = getpwuid(getuid()) else { return }
+        guard managesLaunchService, !isRefreshingLaunchStatus, let plist = Self.backgroundServicePlist else { return }
+        isRefreshingLaunchStatus = true
+        Task.detached(priority: .utility) { [weak self] in
+            let background = SMAppService.statusForLegacyPlist(at: plist)
+            let launchesAtLogin = SMAppService.mainApp.status == .enabled
+            await self?.applyLaunchStatus(background: background, launchAtLogin: launchesAtLogin)
+        }
+    }
+
+    func applyLaunchStatus(background: SMAppService.Status, launchAtLogin: Bool) {
+        isRefreshingLaunchStatus = false
+        if backgroundServiceStatus != background { backgroundServiceStatus = background }
+        if self.launchAtLogin != launchAtLogin { self.launchAtLogin = launchAtLogin }
+    }
+
+    private static var backgroundServicePlist: URL? {
+        guard let user = getpwuid(getuid()) else { return nil }
         let home = String(cString: user.pointee.pw_dir)
-        let plist = URL(fileURLWithPath: home).appending(path: "Library/LaunchAgents/dev.baglayan.Acouplet.agent.plist")
-        backgroundServiceStatus = SMAppService.statusForLegacyPlist(at: plist)
-        launchAtLogin = SMAppService.mainApp.status == .enabled
+        return URL(fileURLWithPath: home).appending(path: "Library/LaunchAgents/dev.baglayan.Acouplet.agent.plist")
     }
 
     func enableLaunchAtLoginByDefault() {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        guard !hasBackgroundService, !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
+        guard !isBackgroundServiceProcess, !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
+        // This runs once per installation, so it may wait for the service's state instead of the background read.
+        if managesLaunchService, let plist = Self.backgroundServicePlist {
+            backgroundServiceStatus = SMAppService.statusForLegacyPlist(at: plist)
+        }
+        guard !hasBackgroundService else { return }
         defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
         if !managesLaunchService || SMAppService.mainApp.status == .notRegistered {
             setLaunchAtLogin(true)
         }
         #endif
+    }
+
+    /// Runs the installer's `--unregister-login-item` or `--register-login-item` command and returns its exit
+    /// status, or returns nil for any other launch.
+    ///
+    /// `AcoupletMain` calls this before `NSApplication` exists, so these short-lived processes never register
+    /// with LaunchServices and a background service starting at the same time cannot take them for a running
+    /// copy of the app. Unregistering prints `login-item: removed` when a registration existed, which tells
+    /// the installer to give it back if the installation is rolled back.
+    static func runLoginItemCommand(_ arguments: [String], defaults: UserDefaults = .standard,
+                                    service: any LoginItemService = SMAppService.mainApp) -> Int32? {
+        guard arguments.count == 2, ["--unregister-login-item", "--register-login-item"].contains(arguments[1]) else {
+            return nil
+        }
+        defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
+        do {
+            if arguments[1] == "--register-login-item" {
+                try service.register()
+            } else if service.status == .enabled || service.status == .requiresApproval {
+                try service.unregister()
+                print("login-item: removed")
+            } else {
+                print("login-item: absent")
+            }
+            return EXIT_SUCCESS
+        } catch {
+            FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+            return EXIT_FAILURE
+        }
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -262,12 +333,22 @@ final class SettingsStore: ObservableObject {
         #endif
         static let reconnectAutomatically = "preferences.reconnectAutomatically"
         static let launchAtLoginDefaultApplied = "preferences.launchAtLoginDefaultApplied"
+        static let lastLaunchedBuild = "lifecycle.lastLaunchedBuild"
         static let globalShortcutEnabled = "preferences.globalShortcutEnabled"
         static let customEqualizerDraft = "preferences.customEqualizerDraft"
         static let equalizerDraftsByDevice = "preferences.equalizerDraftsByDevice"
         static let equalizerProfiles = "preferences.equalizerProfiles"
     }
 }
+
+/// The part of `SMAppService` that the installer's login-item commands use, so tests can replace it.
+protocol LoginItemService {
+    var status: SMAppService.Status { get }
+    func register() throws
+    func unregister() throws
+}
+
+extension SMAppService: LoginItemService {}
 
 #if !ACOUPLET_PUBLIC_APIS_ONLY
 enum LegacyBackgroundService {
@@ -429,17 +510,17 @@ enum LegacyBackgroundService {
         try launchctl(["bootstrap", domain, plistURL.path])
     }
 
-    private static func launchctl(_ arguments: [String]) throws {
-        try command("/bin/launchctl", arguments)
+    static func launchctl(_ arguments: [String], quiet: Bool = false) throws {
+        try command("/bin/launchctl", arguments, quiet: quiet)
     }
 
-    private static func command(_ executable: String, _ arguments: [String]) throws {
+    private static func command(_ executable: String, _ arguments: [String], quiet: Bool = false) throws {
         let process = Process()
         let completion = DispatchSemaphore(value: 0)
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.standardError
+        process.standardError = quiet ? FileHandle.nullDevice : FileHandle.standardError
         process.terminationHandler = { _ in completion.signal() }
         try process.run()
         if completion.wait(timeout: .now() + 5) == .timedOut {

@@ -209,6 +209,17 @@ final class SonyNoiseModeHUD {
                           image: image, headphones: headphones)
     }
 
+    /// Tells the user, without taking focus, that headphones other than the selected ones are asking for a
+    /// confirmation. The menu-bar panel then offers to open Settings for them.
+    func showConfirmationRequest(headphones: SonyHeadphonesController) -> Bool {
+        let image = DeviceIcon.menuBarImage(model: headphones.deviceModel,
+                                           leftConnected: headphones.audioFeatures.leftConnected,
+                                           rightConnected: headphones.audioFeatures.rightConnected)
+        return showNotice(title: String(localized: "\(headphones.deviceName) needs your confirmation"),
+                          detail: String(localized: "Open Acouplet from the menu bar to respond."),
+                          image: image, headphones: headphones)
+    }
+
     #if DEBUG
     func showNoticePreview(title: String, detail: String?, image: NSImage, headphones: SonyHeadphonesController) -> Bool {
         showNotice(title: title, detail: detail, image: image, headphones: headphones)

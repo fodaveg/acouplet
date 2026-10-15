@@ -7,7 +7,7 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>Play Mac audio through your headphones using LDAC. Ordinary playback is temporarily muted while LDAC is on and resumes when it stops. Audio is streamed locally and is not recorded to a file.</string>
     <key>SUFeedURL</key>
-    <string>https://baglayan.dev/updates/appcast.xml</string>
+    <string>$(ACOUPLET_SPARKLE_FEED_URL)</string>
     <key>SUPublicEDKey</key>
     <string>$(ACOUPLET_SPARKLE_PUBLIC_KEY)</string>
     <key>SUVerifyUpdateBeforeExtraction</key>

@@ -80,6 +80,42 @@ struct MenuBarView: View {
                 .scrollBounceBehavior(.basedOnSize)
                 .accessibilityIdentifier("headphones.controlsScroll")
             }
+            ForEach(devicesNeedingConfirmation, id: \.address) { controller in
+                Divider()
+                Button {
+                    dismissMenu()
+                    devices.selectForWorkflow(address: controller.address)
+                    settings.selectedSettingsPane = "headphones"
+                    showSettings()
+                } label: {
+                    Label("\(controller.deviceName) Needs Confirmation…", systemImage: "exclamationmark.bubble")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderless)
+                .tint(nil)
+                .accessibilityIdentifier("menu.otherDeviceConfirmation")
+            }
+            #if !ACOUPLET_PUBLIC_APIS_ONLY
+            if needsLDACDriverUpdate, !showsLDACControl {
+                Divider()
+                Button {
+                    dismissMenu()
+                    ldac.updateDriver()
+                } label: {
+                    Label("Update LDAC Driver…", systemImage: "arrow.down.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderless)
+                .tint(nil)
+                .disabled(ldac.isOpeningDriverInstaller)
+                .help("This version of Acouplet includes a newer LDAC audio driver.")
+                .accessibilityIdentifier("menu.updateLDACDriver")
+            }
+            #endif
             #if ACOUPLET_SPARKLE
             if updater.hasPendingUpdate {
                 Divider()
@@ -131,6 +167,14 @@ struct MenuBarView: View {
 
     private var showsHeadphoneControls: Bool {
         headphones.isReady && headphones.powerOffState == nil && !headphones.headphoneTestNeedsRecovery
+    }
+
+    /// Headphones other than the selected ones that are waiting for a confirmation. Their alert no longer
+    /// switches the selection or opens Settings by itself (decision D14).
+    private var devicesNeedingConfirmation: [SonyHeadphonesController] {
+        devices.controllers.filter {
+            $0 !== headphones && ($0.connectionTransition?.alert != nil || $0.multipointTransition?.alert != nil)
+        }
     }
 
     private var showsConnectOnly: Bool {
@@ -188,8 +232,7 @@ struct MenuBarView: View {
                 .disabled(controlsDisabled)
             }
             #if !ACOUPLET_PUBLIC_APIS_ONLY
-            if showsLDACSession || (settings.experimentalLDACEnabled && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
-                || (ldac.targetAddress == headphones.address && ldac.state != .off))) {
+            if showsLDACControl {
                 ldacControl
             }
             #endif
@@ -229,6 +272,16 @@ struct MenuBarView: View {
     }
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
+    private var showsLDACControl: Bool {
+        showsLDACSession || (settings.experimentalLDACEnabled && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
+            || (ldac.targetAddress == headphones.address && ldac.state != .off)))
+    }
+
+    /// The LDAC controls offer the update themselves; otherwise the panel shows its own row (decision D13).
+    private var needsLDACDriverUpdate: Bool {
+        settings.experimentalLDACEnabled && ldac.driverState == .outdated && !ldac.isSessionRunning
+    }
+
     private var ldacState: LDACState { ldac.targetAddress == headphones.address ? ldac.state : .off }
     private var isTurningOffMultipointForLDAC: Bool { ldac.multipointShutdownAddress == headphones.address }
 
@@ -672,7 +725,8 @@ struct MenuBarView: View {
                 Button("About Acouplet", action: showAbout)
                 .accessibilityIdentifier("menu.about")
                 Divider()
-                if settings.hasBackgroundService {
+                // Quitting concerns this process: only the LaunchAgent's copy sends you to Login Items instead.
+                if settings.isBackgroundServiceProcess {
                     Button("Background Service…") { SMAppService.openSystemSettingsLoginItems() }
                 } else {
                     Button("Quit Acouplet") { NSApp.terminate(nil) }

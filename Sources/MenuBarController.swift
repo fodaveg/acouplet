@@ -132,8 +132,11 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
         let headphones = devices.selectedController
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         let keepsLDACVisible = ldac.targetAddress == headphones.address && ldac.state.keepsMenuBarVisible(isSessionRunning: ldac.isSessionRunning)
+        // The panel offers the driver update instead of opening Installer.app, so it must be reachable (D13).
+        let hasPendingDriverUpdate = settings.experimentalLDACEnabled && ldac.driverState == .outdated && !ldac.isSessionRunning
         #else
         let keepsLDACVisible = false
+        let hasPendingDriverUpdate = false
         #endif
         #if ACOUPLET_SPARKLE
         let hasPendingUpdate = updater.hasPendingUpdate
@@ -141,7 +144,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
         let hasPendingUpdate = false
         #endif
         let keepsFinderVisible = devices.controllers.contains { $0.earbudFinder?.isBusy == true || $0.earbudFinder?.mayBeRinging == true }
-        let isVisible = hasPendingUpdate || settings.keepMenuBarIconWhenDisconnected || headphones.showsMenuBarIcon || keepsFinderVisible
+        let isVisible = hasPendingUpdate || hasPendingDriverUpdate || settings.keepMenuBarIconWhenDisconnected || headphones.showsMenuBarIcon || keepsFinderVisible
             || (keepsLDACVisible && headphones.deviceModel != .unknown)
         if statusItem.isVisible != isVisible { statusItem.isVisible = isVisible }
         guard let button = statusItem.button else { return }

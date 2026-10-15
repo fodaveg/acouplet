@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 import XCTest
 @testable import Acouplet
 
@@ -280,6 +281,100 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testInstallerLoginItemCommandsRunOnlyForTheirArgumentsAndReportRemoval() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let service = FakeLoginItemService(status: .enabled)
+
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet"], defaults: defaults, service: service))
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet", "--background-service"], defaults: defaults, service: service))
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item", "--background-service"],
+                                                       defaults: defaults, service: service))
+        XCTAssertNil(defaults.object(forKey: "preferences.launchAtLoginDefaultApplied"))
+        XCTAssertEqual(service.calls, [])
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister"])
+        XCTAssertEqual(service.status, .notRegistered)
+        XCTAssertTrue(defaults.bool(forKey: "preferences.launchAtLoginDefaultApplied"))
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister"], "An absent login item is not unregistered again")
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--register-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister", "register"])
+        XCTAssertEqual(service.status, .enabled)
+
+        let approval = FakeLoginItemService(status: .requiresApproval)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: approval), EXIT_SUCCESS)
+        XCTAssertEqual(approval.calls, ["unregister"])
+
+        let failing = FakeLoginItemService(status: .enabled, fails: true)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: failing), EXIT_FAILURE)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--register-login-item"], defaults: defaults, service: failing), EXIT_FAILURE)
+    }
+
+    #if canImport(Sparkle)
+    func testUpdatesStayOffInDevelopmentBuildsAndWithoutAFeed() {
+        let feed = "https://baglayan.dev/updates/appcast.xml"
+        XCTAssertTrue(AppUpdater.updatesEnabled(feed: feed, distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: feed, distribution: "development"),
+                       "A local build of the fork never asks upstream's feed for updates")
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: "", distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: nil, distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: "", distribution: "development"))
+    }
+
+    @MainActor
+    func testThisBuildsInfoPlistMatchesItsUpdatePolicy() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let distribution = info["AcoupletDistribution"] as? String
+        let feed = info["SUFeedURL"] as? String
+        XCTAssertEqual(feed, distribution == "development" ? "" : "https://baglayan.dev/updates/appcast.xml")
+        XCTAssertEqual(AppUpdater().isEnabled, distribution != "development")
+    }
+    #endif
+
+    @MainActor
+    func testBackgroundServiceModeFollowsThePlistStateNotTheLaunchArguments() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = SettingsStore(defaults: defaults)
+        XCTAssertFalse(settings.isBackgroundServiceProcess)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertFalse(settings.launchAtLogin)
+
+        settings.applyLaunchStatus(background: .enabled, launchAtLogin: false)
+        XCTAssertTrue(settings.hasBackgroundService, "A copy started without --background-service still sees the installed service")
+        settings.applyLaunchStatus(background: .requiresApproval, launchAtLogin: false)
+        XCTAssertTrue(settings.hasBackgroundService, "A service turned off in Login Items is still the startup mode")
+        settings.applyLaunchStatus(background: .notRegistered, launchAtLogin: true)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertTrue(settings.launchAtLogin)
+        settings.applyLaunchStatus(background: .notFound, launchAtLogin: false)
+        XCTAssertFalse(settings.hasBackgroundService)
+        XCTAssertFalse(settings.launchAtLogin)
+    }
+
+    @MainActor
+    func testFirstLaunchOfEachBuildIsReportedOnceAcrossRelaunches() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(SettingsStore(defaults: defaults).consumeFirstLaunch(ofBuild: "41"))
+        let relaunched = SettingsStore(defaults: defaults)
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: "41"))
+        XCTAssertTrue(relaunched.consumeFirstLaunch(ofBuild: "42"), "An update opens Settings again")
+        XCTAssertFalse(SettingsStore(defaults: defaults).consumeFirstLaunch(ofBuild: "42"))
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: nil))
+        XCTAssertFalse(relaunched.consumeFirstLaunch(ofBuild: ""))
+        XCTAssertEqual(defaults.string(forKey: "lifecycle.lastLaunchedBuild"), "42")
+    }
+
+    @MainActor
     func testGlobalShortcutConflictRecoversAfterRegistrationIsReleased() throws {
         let first = GlobalHotKeyController {}
         let second = GlobalHotKeyController {}
@@ -477,8 +572,11 @@ final class SettingsStoreTests: XCTestCase {
         settings.showBatteryInMenuBar = true
         XCTAssertTrue(SettingsStore(defaults: defaults).showBatteryInMenuBar)
         XCTAssertTrue(settings.reconnectAutomatically)
-        XCTAssertTrue(settings.globalShortcutEnabled)
+        XCTAssertFalse(settings.globalShortcutEnabled, "The system-wide shortcut stays off until someone turns it on")
+        XCTAssertNil(defaults.object(forKey: "preferences.globalShortcutEnabled"))
         XCTAssertEqual(settings.customEqualizerDraft, .flat)
+        settings.globalShortcutEnabled = true
+        XCTAssertTrue(SettingsStore(defaults: defaults).globalShortcutEnabled, "A shortcut turned on deliberately stays on")
 
         settings.reconnectAutomatically = false
         settings.globalShortcutEnabled = false
@@ -490,5 +588,28 @@ final class SettingsStoreTests: XCTestCase {
         let restored = SettingsStore(defaults: defaults)
         XCTAssertEqual(restored.customEqualizerDraft, settings.customEqualizerDraft)
         XCTAssertEqual(restored.equalizerProfiles, [profile])
+    }
+}
+
+private final class FakeLoginItemService: LoginItemService {
+    private(set) var status: SMAppService.Status
+    private(set) var calls: [String] = []
+    private let fails: Bool
+
+    init(status: SMAppService.Status, fails: Bool = false) {
+        self.status = status
+        self.fails = fails
+    }
+
+    func register() throws {
+        guard !fails else { throw CocoaError(.featureUnsupported) }
+        calls.append("register")
+        status = .enabled
+    }
+
+    func unregister() throws {
+        guard !fails else { throw CocoaError(.featureUnsupported) }
+        calls.append("unregister")
+        status = .notRegistered
     }
 }

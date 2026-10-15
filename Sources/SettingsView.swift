@@ -115,10 +115,13 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("settings.appLanguage")
                 if settings.appLanguageNeedsRestart {
-                    Text("Quit and reopen Acouplet to apply the language change.")
+                    Text("Restart Acouplet to apply the language change.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("settings.appLanguageRestart")
+                    Button("Restart Acouplet") { settings.restartApp?() }
+                        .disabled(settings.restartApp == nil)
+                        .accessibilityIdentifier("settings.appLanguageRestartButton")
                 }
                 Toggle("Use system accent color", isOn: $settings.useSystemAccentColor)
                     .accessibilityIdentifier("settings.systemAccent")
@@ -232,13 +235,20 @@ struct SettingsView: View {
                     get: { updater.automaticallyChecksForUpdates },
                     set: { updater.setAutomaticallyChecksForUpdates($0) }
                 ))
+                .disabled(!updater.isEnabled)
                 Toggle("Automatically download and install updates", isOn: Binding(
                     get: { updater.automaticallyDownloadsUpdates },
                     set: { updater.setAutomaticallyDownloadsUpdates($0) }
                 ))
-                .disabled(!updater.allowsAutomaticUpdates)
+                .disabled(!updater.isEnabled || !updater.allowsAutomaticUpdates)
                 Button("Check for Updates…") { updater.checkForUpdates() }
                     .disabled(!updater.canCheckForUpdates)
+                if !updater.isEnabled {
+                    Text("Updates are off in development builds.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("settings.updatesOff")
+                }
             }
             #endif
         }

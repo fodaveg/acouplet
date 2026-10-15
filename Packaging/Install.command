@@ -2,6 +2,8 @@
 set -euo pipefail
 
 package_dir="${0:A:h}"
+# --require-stopped is the local-build mode: it quits the running app and service like any update,
+# and also verifies the package against its Local Build Receipt and writes an install receipt.
 require_stopped=false
 if (( $# )); then
     if (( $# != 1 )) || [[ "$1" != --require-stopped ]]; then
@@ -24,20 +26,30 @@ domain="gui/$(id -u)"
 plist_path="$HOME/Library/LaunchAgents/$label.plist"
 backup_plist="$plist_path.previous-$$"
 process_pattern='^/Applications/Acouplet\.app/Contents/MacOS/Acouplet( |$)'
+ldac_owner_command='/Applications/Acouplet\.app/Contents/MacOS/Acouplet --ldac-owner'
 legacy_apps=("/Applications/XM5 Control Native.app" "/Applications/XM5 Control.app")
 legacy_identifiers=(local.xm5control.native local.xm5control)
 legacy_labels=(local.xm5control.native.agent local.xm5control.agent)
 legacy_patterns=('^/Applications/XM5 Control Native\.app/Contents/MacOS/XM5 Control( |$)' '^/Applications/XM5 Control\.app/Contents/MacOS/XM5 Control( |$)')
 legacy_loaded=()
 
-if [[ "$require_stopped" == true ]]; then
-    for pattern in "$process_pattern" "$legacy_patterns[@]"; do
-        if /usr/bin/pgrep -f "$pattern" >/dev/null; then
-            print -u2 "Quit Acouplet and its previous versions normally before installing this update. Nothing was replaced."
-            exit 1
-        fi
+# Prints the IDs of the running processes that match a pattern, one per line. Acouplet's LDAC owner
+# worker runs the same executable; it only restores the audio route and exits on its own, so it does
+# not count as a running app.
+running_pids() {
+    local pids owners pid
+    pids="$(/usr/bin/pgrep -f "$1" || true)"
+    [[ -n "$pids" ]] || return 0
+    if [[ "$1" != "$process_pattern" ]]; then
+        print -r -- "$pids"
+        return 0
+    fi
+    owners="$(/usr/bin/pgrep -fx "$ldac_owner_command" || true)"
+    for pid in ${(f)pids}; do
+        [[ $'\n'"$owners"$'\n' == *$'\n'"$pid"$'\n'* ]] || print -r -- "$pid"
     done
-fi
+}
+
 if (( EUID == 0 )); then
     print -u2 "Run this installer as your normal logged-in user, without sudo."
     exit 1
@@ -213,6 +225,7 @@ plist_written=false
 service_was_loaded=false
 service_should_start=true
 install_complete=false
+login_item_removed=false
 if [[ -e "$plist_path" ]]; then
     service_should_start=false
 elif [[ -e "$HOME/Library/LaunchAgents/$legacy_labels[1].plist" ]]; then
@@ -223,6 +236,11 @@ fi
 restore_installation() {
     if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
         /bin/launchctl bootout "$domain/$label" || return 1
+    fi
+    # The new app removed the login item before its service started; give it back while that app is
+    # still in place, because older builds cannot register it from the command line.
+    if [[ "$login_item_removed" == true ]] && ! "$installed_executable" --register-login-item >/dev/null; then
+        print -u2 "The previous login item could not be restored. Turn on Launch at login in Acouplet Settings if you used it."
     fi
     if [[ -d "$backup_app" ]]; then
         if [[ -e "$installed_app" ]]; then
@@ -291,12 +309,8 @@ fi
 quit_patterns=("$process_pattern" "$legacy_patterns[@]")
 quit_identifiers=(dev.baglayan.Acouplet "$legacy_identifiers[@]")
 for index in {1..3}; do
-    original_pids="$(/usr/bin/pgrep -f "$quit_patterns[$index]" || true)"
+    original_pids="$(running_pids "$quit_patterns[$index]")"
     if [[ -n "$original_pids" ]]; then
-        if [[ "$require_stopped" == true ]]; then
-            print -u2 "An application opened again. Quit it normally before installing; nothing was replaced."
-            exit 1
-        fi
         if ! /usr/bin/osascript - "$quit_identifiers[$index]" <<'APPLESCRIPT'
 on run arguments
     with timeout of 30 seconds
@@ -352,12 +366,12 @@ for pattern in "$legacy_patterns[@]"; do
     fi
 done
 for attempt in {1..20}; do
-    if ! /usr/bin/pgrep -f "$process_pattern" >/dev/null; then
+    if [[ -z "$(running_pids "$process_pattern")" ]]; then
         break
     fi
     sleep 0.25
 done
-if /usr/bin/pgrep -f "$process_pattern" >/dev/null; then
+if [[ -n "$(running_pids "$process_pattern")" ]]; then
     print -u2 "Acouplet has not stopped. No app files were replaced; try again after it closes."
     exit 1
 fi
@@ -421,6 +435,13 @@ if [[ ! -e "$plist_path" ]] ||
     /usr/bin/plutil -lint "$plist_path"
 fi
 if [[ "$service_should_start" == true ]]; then
+    # Remove the login item before the service starts. A copy of the app that is still running when
+    # the service checks for duplicates makes the service quit, and a clean exit is not relaunched.
+    if ! login_item_result="$("$installed_executable" --unregister-login-item)"; then
+        print -u2 "The previous login-item registration could not be removed."
+        exit 1
+    fi
+    if [[ "$login_item_result" == *"login-item: removed"* ]]; then login_item_removed=true; fi
     /bin/launchctl bootstrap "$domain" "$plist_path"
     for attempt in {1..20}; do
         service_state="$(/bin/launchctl print "$domain/$label")"
@@ -458,10 +479,6 @@ for index in {1..2}; do
     fi
     rm -f "$HOME/Library/LaunchAgents/$legacy_label.plist"
 done
-if [[ "$service_should_start" == true ]] && ! "$installed_executable" --unregister-login-item; then
-    print -u2 "Acouplet is installed, but its previous login-item registration could not be removed. Run the installer again to retry."
-    exit 1
-fi
 if ! /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$installed_app"; then
     print -u2 "Acouplet is installed, but its application registration could not be refreshed. Run the installer again to retry."
     exit 1
@@ -519,14 +536,37 @@ if [[ "$verify_local_update" == true ]]; then
     } > "$receipt"
     print -r -- "Install receipt: $receipt"
 fi
+agent_pid=""
 if [[ "$service_should_start" == true ]]; then
-    print "Acouplet is installed and running in the background."
+    # Report the service only if it is still running now, and start it once more if it has quit.
+    for attempt in {1..20}; do
+        agent_pid="$(/bin/launchctl print "$domain/$label" 2>/dev/null | /usr/bin/awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)"
+        [[ -z "$agent_pid" ]] || break
+        if (( attempt == 1 )); then /bin/launchctl kickstart "$domain/$label" >/dev/null 2>&1 || true; fi
+        sleep 0.25
+    done
+    if [[ -z "$agent_pid" ]]; then
+        print -u2 "Acouplet is installed, but its background service is not running. Open Acouplet from Applications to start it."
+        exit 1
+    fi
+    print "Acouplet is installed and running in the background (process $agent_pid)."
+    print "It opens its settings the first time a new version runs. After that, its menu-bar icon appears when a supported Sony device is connected."
 else
     print "Acouplet is updated. Its previously stopped background service remains stopped."
+    print "Its menu-bar icon appears when a supported Sony device is connected."
 fi
-print "Its menu-bar icon appears when a supported Sony device is connected."
 print "Background access is managed in System Settings > General > Login Items & Extensions."
 if [[ -f "$installed_app/Contents/Resources/Acouplet LDAC Output.pkg" ]]; then
-    print "Enable LDAC in the app to authorize its bundled driver installation."
-    print "Restart the Mac to activate the driver. This app installer did not install it or restart Core Audio."
+    # The app compares its bundled driver with the installed and loaded ones; only it can read the loaded revision.
+    driver_state="$("$installed_executable" --ldac-driver-state 2>/dev/null || true)"
+    case "$driver_state" in
+        current) print "The LDAC audio driver is already up to date; no restart is needed." ;;
+        restartRequired) print "The LDAC audio driver is installed. Restart the Mac to activate it." ;;
+        outdated) print "This version includes a newer LDAC audio driver. Use Update LDAC Driver in the app, then restart the Mac to activate it." ;;
+        missing) print "To use LDAC, turn it on in the app to install its audio driver, then restart the Mac to activate it." ;;
+        *) print "The LDAC audio driver could not be checked. Open the app's LDAC settings for details." ;;
+    esac
+    if [[ "$driver_state" != current ]]; then
+        print "This app installer did not install the driver or restart Core Audio."
+    fi
 fi

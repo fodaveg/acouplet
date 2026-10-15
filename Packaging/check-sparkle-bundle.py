@@ -10,7 +10,10 @@ def code_targets(app):
 
 def check_bundle(app):
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
-    expected = {'SUFeedURL': 'https://baglayan.dev/updates/appcast.xml',
+    # Development builds (package.sh --local) carry no feed: upstream's releases share the signing key and
+    # would replace a local build of the fork. The app does not start its updater without one.
+    feed = '' if info.get('AcoupletDistribution') == 'development' else 'https://baglayan.dev/updates/appcast.xml'
+    expected = {'SUFeedURL': feed,
                 'SUVerifyUpdateBeforeExtraction': True, 'SURequireSignedFeed': True,
                 'SUSignedFeedFailureExpirationInterval': 0, 'SUEnableInstallerLauncherService': False,
                 'SUEnableDownloaderService': False, 'SUEnableSystemProfiling': False,

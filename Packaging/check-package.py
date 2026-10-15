@@ -112,9 +112,11 @@ elif name == 'xcrun':
         metadata_file.write_text(json.dumps(metadata))
         if bundle == app:
             (bundle / 'Contents').mkdir(exist_ok=True)
+            distribution = settings['ACOUPLET_DISTRIBUTION'] if mode != 'wrong-distribution' else ('production' if settings['ACOUPLET_DISTRIBUTION'] == 'development' else 'development')
+            feed = 'https://baglayan.dev/updates/appcast.xml' if distribution != 'development' or mode == 'development-upstream-feed' else ''
             (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleVersion': metadata['build'], 'CFBundleExecutable': 'Acouplet',
-                'AcoupletDistribution': settings['ACOUPLET_DISTRIBUTION'] if mode != 'wrong-distribution' else ('production' if settings['ACOUPLET_DISTRIBUTION'] == 'development' else 'development'),
-                'SUFeedURL': 'https://baglayan.dev/updates/appcast.xml', 'SUPublicEDKey': 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=',
+                'AcoupletDistribution': distribution,
+                'SUFeedURL': feed, 'SUPublicEDKey': 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=',
                 'SUVerifyUpdateBeforeExtraction': True, 'SURequireSignedFeed': True, 'SUSignedFeedFailureExpirationInterval': 0,
                 'SUEnableInstallerLauncherService': False, 'SUEnableDownloaderService': False, 'SUEnableSystemProfiling': False,
                 'SUEnableAutomaticChecks': True, 'SUAutomaticallyUpdate': False}))
@@ -375,6 +377,7 @@ def check(name, signing, mode='success', succeeds=True, local=False, panes=False
             if mode.startswith('debuggable-'): assert 'must omit debugger access in Release' in result.stderr, result.stderr
             if mode == 'sandboxed-app': assert 'must omit the sandbox entitlement' in result.stderr, result.stderr
             if mode == 'wrong-distribution': assert 'must declare the requested' in result.stderr, result.stderr
+            if mode == 'development-upstream-feed': assert 'Incorrect Sparkle policy: SUFeedURL' in result.stderr, result.stderr
         print(name + ': passed')
 
 
@@ -408,6 +411,7 @@ check('production-rejects-development-metadata', {}, 'wrong-distribution', False
 check('local-rejects-production-metadata', {}, 'wrong-distribution', False, local=True)
 check('production-ignores-development-environment', {'ACOUPLET_DISTRIBUTION': 'development'})
 check('local-ignores-production-environment', {'ACOUPLET_DISTRIBUTION': 'production'}, local=True)
+check('local-rejects-upstream-update-feed', {}, 'development-upstream-feed', False, local=True)
 check('website-stage-production-without-zip', {}, direct=True)
 check('missing-license', {}, 'missing-license', False)
 check('stale-notices', {}, 'stale-notices', False)

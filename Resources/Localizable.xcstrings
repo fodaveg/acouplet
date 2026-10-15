@@ -16841,23 +16841,6 @@
         }
       }
     },
-    "Quit and reopen Acouplet to apply the language change.": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Quit and reopen Acouplet to apply the language change."
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Dil değişikliğini uygulamak için Acouplet’i kapatıp yeniden açın."
-          }
-        }
-      }
-    },
     "Use system accent color": {
       "extractionState": "manual",
       "localizations": {
@@ -16871,6 +16854,142 @@
           "stringUnit": {
             "state": "translated",
             "value": "Sistem vurgu rengini kullan"
+          }
+        }
+      }
+    },
+    "Restart Acouplet to apply the language change.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Acouplet to apply the language change."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dil değişikliğini uygulamak için Acouplet’i yeniden başlatın."
+          }
+        }
+      }
+    },
+    "Restart Acouplet": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restart Acouplet"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acouplet’i Yeniden Başlat"
+          }
+        }
+      }
+    },
+    "Updates are off in development builds.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Updates are off in development builds."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geliştirme derlemelerinde güncellemeler kapalıdır."
+          }
+        }
+      }
+    },
+    "Update LDAC Driver…": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update LDAC Driver…"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC Sürücüsünü Güncelle…"
+          }
+        }
+      }
+    },
+    "This version of Acouplet includes a newer LDAC audio driver.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This version of Acouplet includes a newer LDAC audio driver."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acouplet’in bu sürümü daha yeni bir LDAC ses sürücüsü içeriyor."
+          }
+        }
+      }
+    },
+    "%@ needs your confirmation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ needs your confirmation"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ onayınızı bekliyor"
+          }
+        }
+      }
+    },
+    "Open Acouplet from the menu bar to respond.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Acouplet from the menu bar to respond."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yanıtlamak için menü çubuğundan Acouplet’i açın."
+          }
+        }
+      }
+    },
+    "%@ Needs Confirmation…": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Needs Confirmation…"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Onay Bekliyor…"
           }
         }
       }

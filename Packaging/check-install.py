@@ -51,9 +51,17 @@ elif name == 'plutil':
         assert args[0] == '-lint', args
 elif name == 'pgrep':
     processes = json.loads(process_file.read_text())
+    owners = processes.get('owner', [])
+    if args[0] == '-fx':
+        assert args[-1].endswith('/Acouplet --ldac-owner'), args
+        if not owners: sys.exit(1)
+        print('\n'.join(str(pid) for pid in owners))
+        sys.exit(0)
     key = 'legacy' if 'XM5 Control Native' in args[-1] else 'older' if 'XM5 Control' in args[-1] else 'native'
-    if processes[key]:
-        print('\n'.join(str(pid) for pid in processes[key]))
+    # The LDAC owner worker runs the app's executable, so the app's own pattern finds it too.
+    matches = processes[key] + (owners if key == 'native' else [])
+    if matches:
+        print('\n'.join(str(pid) for pid in matches))
     else:
         sys.exit(0 if mode == 'legacy-running' and 'XM5 Control Native' in args[-1] else 1)
 elif name == 'kill':
@@ -105,7 +113,13 @@ elif name == 'launchctl':
         service = state[label]
         if args[0] == 'print':
             if not service['loaded']: sys.exit(1)
-            print('state = running\n\tprogram = ' + service['program'])
+            running = True
+            if mode in ('agent-exited', 'agent-stays-stopped') and label == 'dev.baglayan.Acouplet.agent' and service['version'] == 'new':
+                # The new service is running when the bootstrap returns, then quits before the installer finishes.
+                service['prints'] = service.get('prints', 0) + 1
+                state_file.write_text(json.dumps(state))
+                running = service['prints'] == 1 or service.get('kickstarted', False)
+            print(('state = running\n\tpid = 4242' if running else 'state = not running') + '\n\tprogram = ' + service['program'])
         else:
             if mode == 'stop-failure' or mode == 'legacy-stop-failure' and label == 'local.xm5control.native.agent': sys.exit(24)
             service['loaded'] = False
@@ -121,13 +135,27 @@ elif name == 'launchctl':
         if mode in ('bootstrap-failure', 'matching-plist-failure', 'restore-plist-failure', 'login-item-rollback') and version == 'new' or mode == 'restart-failure' and version == 'old': sys.exit(25)
         state[config['Label']] = {'loaded': True, 'program': str(program), 'version': version}
         state_file.write_text(json.dumps(state))
+    elif args[0] == 'kickstart':
+        service = state[args[1].split('/')[-1]]
+        assert service['loaded'], args
+        service['kickstarted'] = mode != 'agent-stays-stopped'
+        state_file.write_text(json.dumps(state))
     else:
         raise AssertionError('Unexpected launchctl command: ' + str(args))
 elif name in ('Acouplet', 'XM5 Control'):
-    assert args == ['--unregister-login-item'], args
+    assert args == ['--unregister-login-item'] or name == 'Acouplet' and args in (['--register-login-item'], ['--ldac-driver-state']), args
+    if args == ['--ldac-driver-state']:
+        driver_state = (root / 'driver-state').read_text() if (root / 'driver-state').exists() else 'missing'
+        if driver_state == 'fail': sys.exit(1)
+        print(driver_state)
+        sys.exit(0)
     if mode == 'helper-failure' and name == 'Acouplet': sys.exit(19)
     if mode == 'legacy-helper-failure' and name == 'XM5 Control': sys.exit(19)
-    if name == 'Acouplet': (root / 'login-item.json').write_text(json.dumps({'enabled': False}))
+    if name == 'Acouplet':
+        login_item = root / 'login-item.json'
+        enabled = json.loads(login_item.read_text())['enabled']
+        if args == ['--unregister-login-item']: print('login-item: ' + ('removed' if enabled else 'absent'))
+        login_item.write_text(json.dumps({'enabled': args == ['--register-login-item']}))
 elif name != 'sleep':
     raise AssertionError('Unexpected stub: ' + name)
 '''
@@ -225,6 +253,7 @@ def fixture(root, mode):
         'quit_requested': False, 'exit_checks': 0,
         'legacy': [200] if mode in ('legacy-quit-success', 'legacy-quit-declined') else [],
         'older': [201] if mode == 'legacy-quit-success' else [],
+        'owner': [150] if mode == 'ldac-owner-running' else [],
     }))
     return configs, state
 
@@ -249,7 +278,8 @@ scenarios = ('helper-failure', 'success', 'matching-plist', 'matching-plist-fail
              'unrelated-legacy', 'repurposed-legacy', 'symlink-agent', 'orphan-service', 'concurrent-install',
              'native-quit-declined', 'native-quit-timeout', 'native-quit-stalled', 'native-partial-quit',
              'native-keepalive-relaunch', 'native-delayed-quit', 'login-item-rollback',
-             'controls-unregister-failure', 'embedded-controls', 'foreign-controls')
+             'controls-unregister-failure', 'embedded-controls', 'foreign-controls', 'ldac-owner-running',
+             'agent-exited', 'agent-stays-stopped')
 for scenario in scenarios:
     with tempfile.TemporaryDirectory(prefix='acouplet-install-check-') as directory:
         root = Path(directory)
@@ -267,7 +297,8 @@ for scenario in scenarios:
         output = result.stdout + result.stderr
         state = json.loads((root / 'state.json').read_text())
         successful = scenario in ('success', 'matching-plist', 'fresh-install', 'inactive-update',
-                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success')
+                                  'native-keepalive-relaunch', 'native-delayed-quit', 'legacy-quit-success', 'ldac-owner-running',
+                                  'agent-exited')
         assert (result.returncode == 0) == successful, (scenario, result.returncode, output)
         recovery_apps = [path for path in applications.glob('.*previous-*.app') if 'interrupted' not in path.name]
         recovery_plists = [path for path in agents.glob('*.previous-*') if 'interrupted' not in path.name]
@@ -282,10 +313,13 @@ for scenario in scenarios:
             assert len(recovery_plists) == 1, output
         else:
             assert not recovery_apps and not recovery_plists and not staged_apps, output
-            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure') or scenario in ('native-register-failure', 'helper-failure') else 'old'
+            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure', 'native-register-failure', 'agent-stays-stopped') else 'old'
             assert (native / 'version').read_text() == expected, output
         if successful:
             assert json.loads((root / 'login-item.json').read_text())['enabled'] == (scenario == 'inactive-update'), output
+            assert ('running in the background (process 4242)' in output) == (scenario != 'inactive-update'), output
+            restarts = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines() if '"kickstart"' in line]
+            assert len(restarts) == (1 if scenario == 'agent-exited' else 0), restarts
             assert state[native_label]['loaded'] == (scenario != 'inactive-update'), state
             assert plistlib.loads(plist.read_bytes()) == {
                 'Label': native_label,
@@ -298,13 +332,17 @@ for scenario in scenarios:
             assert not state[legacy_label]['loaded'] and not (agents / (legacy_label + '.plist')).exists(), state
         elif scenario in ('legacy-unregister-failure', 'legacy-helper-failure'):
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new' and legacy.exists(), state
-        elif scenario in ('native-register-failure', 'helper-failure'):
+        elif scenario == 'agent-stays-stopped':
+            assert state[native_label]['loaded'] and state[native_label]['version'] == 'new', state
+            assert 'background service is not running' in output and 'running in the background' not in output, output
+        elif scenario == 'native-register-failure':
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new', state
             assert not state[legacy_label]['loaded'] and not legacy.exists(), state
-            assert ('application registration could not be refreshed' if scenario == 'native-register-failure'
-                    else 'previous login-item registration could not be removed') in output
-        elif scenario in ('bootstrap-failure', 'matching-plist-failure', 'installed-validation-failure'):
+            assert 'application registration could not be refreshed' in output
+        elif scenario in ('bootstrap-failure', 'matching-plist-failure', 'installed-validation-failure', 'helper-failure'):
             assert state == original_state and plist.read_bytes() == configs[native_label], state
+            if scenario == 'helper-failure':
+                assert 'previous login-item registration could not be removed' in output and legacy.exists(), output
         elif scenario not in ('restore-app-failure', 'restore-plist-failure', 'move-new-failure', 'restart-failure'):
             assert state == original_state and (plist.read_bytes() if plist.exists() else None) == before_plist, (scenario, state, original_state, output)
         if scenario in ('matching-plist', 'matching-plist-failure'):
@@ -314,10 +352,18 @@ for scenario in scenarios:
             assert ['lsregister', '-f', str(native)] in commands, commands
             assert (['Acouplet', '--unregister-login-item'] in commands) == (scenario != 'inactive-update'), commands
             assert commands.count(['XM5 Control', '--unregister-login-item']) == 2, commands
+            if scenario != 'inactive-update':
+                # The login item goes before the service starts, so no copy of the app is running when it checks for duplicates.
+                bootstrap_index = next(index for index, command in enumerate(commands)
+                                       if command[:2] == ['launchctl', 'bootstrap'] and command[3].endswith(native_label + '.plist'))
+                assert commands.index(['Acouplet', '--unregister-login-item']) < bootstrap_index, commands
+            assert ['Acouplet', '--register-login-item'] not in commands, commands
         if scenario in ('login-item-rollback', 'helper-failure'):
             assert json.loads((root / 'login-item.json').read_text())['enabled']
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
-            assert (['Acouplet', '--unregister-login-item'] in commands) == (scenario == 'helper-failure'), commands
+            assert ['Acouplet', '--unregister-login-item'] in commands, commands
+            # A failed start gives the login item back; a failed removal never took it away.
+            assert (['Acouplet', '--register-login-item'] in commands) == (scenario == 'login-item-rollback'), commands
         if scenario.startswith('native-quit-') or scenario == 'native-partial-quit':
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
             assert ['osascript', '-', 'dev.baglayan.Acouplet'] in commands, commands
@@ -331,7 +377,7 @@ for scenario in scenarios:
             assert ['osascript', '-', 'local.xm5control.native'] in commands and ['osascript', '-', 'local.xm5control'] in commands, commands
             first_move = next(index for index, command in enumerate(commands) if command[0] == 'mv')
             assert commands.index(['kill', '-0', '200']) < first_move and commands.index(['kill', '-0', '201']) < first_move, commands
-        if scenario in ('success', 'native-keepalive-relaunch', 'native-delayed-quit'):
+        if scenario in ('success', 'native-keepalive-relaunch', 'native-delayed-quit', 'ldac-owner-running'):
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
             quit_index = commands.index(['osascript', '-', 'dev.baglayan.Acouplet'])
             bootout_index = next(index for index, command in enumerate(commands)
@@ -352,7 +398,7 @@ for scenario in scenarios:
             assert not controls.exists()
             assert unregistered == (scenario != 'fresh-install'), commands
             assert not reregistered, commands
-        if scenario in ('bootstrap-failure', 'matching-plist-failure', 'login-item-rollback'):
+        if scenario in ('bootstrap-failure', 'matching-plist-failure', 'login-item-rollback', 'helper-failure'):
             assert controls.exists() and unregistered and reregistered, commands
         if scenario in ('embedded-controls', 'foreign-controls'):
             assert not unregistered and not reregistered, commands
@@ -399,10 +445,10 @@ for scenario in ('success', 'orphan-service', 'unexpected-agent', 'unexpected-lo
         assert (root / 'Preferences/dev.baglayan.Acouplet.plist').read_text() == 'preserve'
         print('uninstall-' + scenario + ': passed')
 
-for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-stage-changed', 'local-hud-check-changed', 'local-ldac-media-changed', 'local-audio-capture-changed', 'local-output-driver-changed', 'local-output-driver-info-changed', 'local-driver-installer-changed', 'local-driver-uninstaller-changed', 'local-resource-seal-changed'):
+for scenario in ('running', 'running-release-changed', 'local-stopped', 'local-release-changed', 'local-stage-changed', 'local-hud-check-changed', 'local-ldac-media-changed', 'local-audio-capture-changed', 'local-output-driver-changed', 'local-output-driver-info-changed', 'local-driver-installer-changed', 'local-driver-uninstaller-changed', 'local-resource-seal-changed'):
     with tempfile.TemporaryDirectory(prefix='acouplet-local-install-check-') as directory:
         root = Path(directory)
-        mode = 'success' if scenario == 'running' else 'inactive-update'
+        mode = 'success' if scenario.startswith('running') else 'inactive-update'
         _, initial_state = fixture(root, mode)
         source = root / 'package/Acouplet.app'
         binaries = ('Contents/MacOS/Acouplet', 'Contents/Helpers/Acouplet Battery Publisher', 'Contents/Frameworks/SonyNativeHUD.dylib', 'Contents/Helpers/SonyNativeHUDCheck', 'Contents/Resources/Assets.car', 'Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle', 'Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate', 'Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater', 'Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer', 'Contents/Helpers/LDACSignaling', 'Contents/Helpers/LDACMediaTransport', 'Contents/Helpers/SonyAudioConnection', 'Contents/Helpers/LDACLogObserver', 'Contents/Helpers/Acouplet Audio.app/Contents/MacOS/AcoupletAudio', 'Contents/Helpers/AcoupletLDACOutput.driver/Contents/MacOS/AcoupletVirtualOutput', 'Contents/Helpers/AcoupletLDACOutput.driver/Contents/Info.plist', 'Contents/Resources/Acouplet LDAC Output.pkg', 'Contents/Resources/Acouplet LDAC Removal.pkg', 'Contents/_CodeSignature/CodeResources')
@@ -415,7 +461,7 @@ for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-sta
         lines = ['Prepared UTC: 2026-09-27T00:00:00Z', 'Revision: fixture', 'Worktree: dirty', 'Release app: ' + str(release)]
         lines += ['SHA256\t' + hashlib.sha256((source / relative).read_bytes()).hexdigest() + '\t' + relative for relative in binaries]
         (root / 'package/Local Build Receipt.txt').write_text('\n'.join(lines) + '\n')
-        if scenario == 'local-release-changed': (release / binaries[0]).write_text('later build')
+        if scenario in ('local-release-changed', 'running-release-changed'): (release / binaries[0]).write_text('later build')
         if scenario == 'local-stage-changed': (source / binaries[1]).write_text('changed stage')
         if scenario == 'local-hud-check-changed': (source / 'Contents/Helpers/SonyNativeHUDCheck').write_text('changed probe')
         if scenario == 'local-ldac-media-changed': (source / 'Contents/Helpers/LDACMediaTransport').write_text('changed encoder')
@@ -427,16 +473,17 @@ for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-sta
         if scenario == 'local-resource-seal-changed': (source / 'Contents/_CodeSignature/CodeResources').write_text('changed resource seal')
         result = run(root, mode, arguments=('--require-stopped',))
         commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
-        assert not any(command[0] == 'osascript' for command in commands), commands
+        # The local-build mode quits the running app itself, but only once the receipt has been verified.
+        assert any(command[0] == 'osascript' for command in commands) == (scenario == 'running'), commands
         receipts = list(root.glob('Local Install-*.txt'))
         installed = root / 'Applications/Acouplet.app'
-        if scenario == 'local-stopped':
+        if scenario in ('local-stopped', 'running'):
             assert result.returncode == 0, result.stdout + result.stderr
             assert len(receipts) == 1
             assert 'Release/staged/installed identity and strict signature verification: passed' in receipts[0].read_text()
             assert 'Installed UTC:' in receipts[0].read_text()
             for relative in binaries: assert (installed / relative).read_bytes() == (release / relative).read_bytes()
-            assert not json.loads((root / 'state.json').read_text())[native_label]['loaded']
+            assert json.loads((root / 'state.json').read_text())[native_label]['loaded'] == (scenario == 'running')
         else:
             assert result.returncode != 0, result.stdout + result.stderr
             assert not receipts
@@ -445,6 +492,25 @@ for scenario in ('running', 'local-stopped', 'local-release-changed', 'local-sta
         assert (root / 'Preferences/dev.baglayan.Acouplet.plist').read_text() == 'preserve'
         print('require-stopped-' + scenario + ': passed')
 
+
+for driver_state, message in (('current', 'already up to date; no restart is needed'),
+                              ('restartRequired', 'The LDAC audio driver is installed. Restart the Mac to activate it.'),
+                              ('outdated', 'includes a newer LDAC audio driver. Use Update LDAC Driver in the app'),
+                              ('missing', 'turn it on in the app to install its audio driver'),
+                              ('unavailable', 'could not be checked'), ('fail', 'could not be checked')):
+    with tempfile.TemporaryDirectory(prefix='acouplet-driver-message-check-') as directory:
+        root = Path(directory)
+        fixture(root, 'success')
+        driver_installer = root / 'package/Acouplet.app/Contents/Resources/Acouplet LDAC Output.pkg'
+        driver_installer.parent.mkdir(parents=True)
+        driver_installer.write_text('fixture')
+        (root / 'driver-state').write_text(driver_state)
+        result = run(root, 'success')
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert message in result.stdout, (driver_state, result.stdout)
+        assert ('restart the mac' in result.stdout.lower()) == (driver_state not in ('current', 'unavailable', 'fail')), result.stdout
+        assert ('did not install the driver' in result.stdout) == (driver_state != 'current'), result.stdout
+        print('driver-message-' + driver_state + ': passed')
 
 for scenario in ('pane-success', 'pane-legacy-target', 'pane-foreign-target', 'pane-symlink-target', 'pane-bad-signature', 'pane-stage-failure', 'pane-commit-failure', 'pane-foreign-prototype'):
     with tempfile.TemporaryDirectory(prefix='acouplet-pane-install-check-') as directory:
