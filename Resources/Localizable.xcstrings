@@ -14308,6 +14308,23 @@
         }
       }
     },
+    "The LDAC audio output did not respond in time.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC ses çıkışı zamanında yanıt vermedi."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The LDAC audio output did not respond in time."
+          }
+        }
+      }
+    },
     "Waiting for the earbuds to finish.": {
       "extractionState": "manual",
       "localizations": {

@@ -42,11 +42,28 @@ private struct LDACOwnerError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// A `configure` request that the owner did not answer in time. The owner keeps running, so callers may retry.
+struct LDACOwnerTimeoutError: LocalizedError {
+    var errorDescription: String? { String(localized: "The LDAC audio output did not respond in time.") }
+}
+
+/// Outcome of a request to the owner process, delivered once to the waiting continuation.
+private enum LDACOwnerReply: Sendable {
+    case reply(LDACNativeVolume?, String?)
+    /// The owner had already ended before the request was sent.
+    case unavailable
+    case writeFailed(any Error)
+    case timedOut
+    /// The owner ended while the request waited.
+    case ended
+}
+
 private final class LDACOwnerChannel: @unchecked Sendable {
     private let child: LDACNativeChild
     private let lock = NSLock()
-    private let exited = DispatchSemaphore(value: 0)
-    private var replies: [UUID: (signal: DispatchSemaphore, message: LDACOwnerMessage?)] = [:]
+    /// Requests waiting for their reply. They suspend instead of blocking a cooperative-pool thread (L12).
+    private var replies: [UUID: CheckedContinuation<LDACOwnerReply, Never>] = [:]
+    private var exitWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var ended = false
     private var closing = false
     private var recovery: LDACRouteRecovery?
@@ -78,44 +95,90 @@ private final class LDACOwnerChannel: @unchecked Sendable {
         if case .stop = command, shutdownDeadline == nil { shutdownDeadline = .now() + 120 }
     }
 
-    func request(_ command: LDACOwnerCommand, timeout: TimeInterval = 10) throws -> LDACNativeVolume? {
+    /// Sends a request and suspends until its reply, without holding a cooperative-pool thread (L12). A late
+    /// `configure` only reports the delay: the owner may be busy in Core Audio, and the stop or release that follows
+    /// carries its own deadline for a hung owner. Any other late request still shuts the owner down.
+    func request(_ command: LDACOwnerCommand, timeout: TimeInterval = 10) async throws -> LDACNativeVolume? {
+        let tolerant: Bool
+        if case .configure = command { tolerant = true } else { tolerant = false }
         let id = UUID()
-        let signal = DispatchSemaphore(value: 0)
-        lock.lock()
-        guard !ended else {
+        let reply: LDACOwnerReply = await withCheckedContinuation { continuation in
+            lock.lock()
+            guard !ended else {
+                lock.unlock()
+                continuation.resume(returning: .unavailable)
+                return
+            }
+            replies[id] = continuation
+            do { try write(LDACOwnerRequest(id: id, command: command)) }
+            catch {
+                replies[id] = nil
+                lock.unlock()
+                continuation.resume(returning: .writeFailed(error))
+                return
+            }
             lock.unlock()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.resolve(id, with: .timedOut)
+            }
+        }
+        switch reply {
+        case let .reply(controls, error):
+            if let error { throw LDACOwnerError(message: error) }
+            return controls
+        case .unavailable:
             throw LDACOwnerError(message: String(localized: "LDAC playback stopped unexpectedly. Try again."))
-        }
-        replies[id] = (signal, nil)
-        do { try write(LDACOwnerRequest(id: id, command: command)) }
-        catch { replies[id] = nil; lock.unlock(); throw error }
-        lock.unlock()
-        _ = signal.wait(timeout: .now() + timeout)
-        lock.lock()
-        defer { lock.unlock() }
-        guard case let .reply(_, controls, error) = replies.removeValue(forKey: id)?.message else {
-            shutdown()
+        case let .writeFailed(error):
+            throw error
+        case .ended:
             throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
-        }
-        if let error { throw LDACOwnerError(message: error) }
-        return controls
-    }
-
-    func finish(disconnected: Bool) throws {
-        lock.lock()
-        closing = true
-        lock.unlock()
-        _ = try request(.release(disconnected), timeout: 120)
-        guard exited.wait(timeout: .now() + 3) == .success else {
-            throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
+        case .timedOut:
+            guard tolerant else {
+                lock.withLock { shutdown() }
+                throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
+            }
+            throw LDACOwnerTimeoutError()
         }
     }
 
-    func restore(_ recovery: LDACRouteRecovery) throws {
+    private func resolve(_ id: UUID, with reply: LDACOwnerReply) {
+        let continuation = lock.withLock { replies.removeValue(forKey: id) }
+        continuation?.resume(returning: reply)
+    }
+
+    func finish(disconnected: Bool) async throws {
         lock.withLock { closing = true }
-        _ = try request(.restore(recovery), timeout: 65)
-        guard exited.wait(timeout: .now() + 3) == .success else {
+        _ = try await request(.release(disconnected), timeout: 120)
+        guard await waitForExit(timeout: 3) else {
             throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
+        }
+    }
+
+    func restore(_ recovery: LDACRouteRecovery) async throws {
+        lock.withLock { closing = true }
+        _ = try await request(.restore(recovery), timeout: 65)
+        guard await waitForExit(timeout: 3) else {
+            throw LDACOwnerError(message: String(localized: "LDAC did not stop completely."))
+        }
+    }
+
+    /// Suspends until the owner process has been reaped, or `timeout` passes.
+    private func waitForExit(timeout: TimeInterval) async -> Bool {
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            lock.lock()
+            guard !ended else {
+                lock.unlock()
+                continuation.resume(returning: true)
+                return
+            }
+            exitWaiters[id] = continuation
+            lock.unlock()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self else { return }
+                let waiter = self.lock.withLock { self.exitWaiters.removeValue(forKey: id) }
+                waiter?.resume(returning: false)
+            }
         }
     }
 
@@ -149,14 +212,12 @@ private final class LDACOwnerChannel: @unchecked Sendable {
                         let message = try JSONDecoder().decode(LDACOwnerMessage.self, from: Data(line.utf8))
                         if case let .recovery(state) = message {
                             lock.withLock { recovery = state }
-                        } else if case let .reply(id, controls, _) = message {
+                        } else if case let .reply(id, controls, error) = message {
                             lock.lock()
                             if let controls { latestControls = controls }
-                            if let pending = replies[id] {
-                                replies[id] = (pending.signal, message)
-                                pending.signal.signal()
-                            }
+                            let pending = replies.removeValue(forKey: id)
                             lock.unlock()
+                            pending?.resume(returning: .reply(controls, error))
                         } else {
                             if case let .controls(controls) = message { lock.withLock { latestControls = controls } }
                             DispatchQueue.main.async { self.receive(message) }
@@ -179,9 +240,13 @@ private final class LDACOwnerChannel: @unchecked Sendable {
         ended = true
         cleanExit = child.exitCode == 0 && !invalid
         let notify = !closing
-        for pending in replies.values { pending.signal.signal() }
-        exited.signal()
+        let pending = Array(replies.values)
+        replies = [:]
+        let waiters = Array(exitWaiters.values)
+        exitWaiters = [:]
         lock.unlock()
+        for continuation in pending { continuation.resume(returning: .ended) }
+        for waiter in waiters { waiter.resume(returning: true) }
         if notify { DispatchQueue.main.async { self.receive(.exited) } }
     }
 }
@@ -204,7 +269,7 @@ final class LDACOwnerOutput {
         self.channel = channel
         do {
             let controls = try await withTaskCancellationHandler {
-                try await Task.detached { try channel.request(.claim(self.id, targetAddress, model, sampleRate), timeout: 65) }.value
+                try await channel.request(.claim(self.id, targetAddress, model, sampleRate), timeout: 65)
             } onCancel: {
                 try? channel.send(.cancelStart)
             }
@@ -236,7 +301,7 @@ final class LDACOwnerOutput {
         defer { self.channel = nil }
         if channel.hasEnded && channel.cleaned { return nil }
         do {
-            try await Task.detached { try channel.finish(disconnected: targetDisconnected) }.value
+            try await channel.finish(disconnected: targetDisconnected)
             return nil
         } catch {
             channel.close()
@@ -244,7 +309,7 @@ final class LDACOwnerOutput {
                 do {
                     let replacement = try LDACOwnerChannel { _ in }
                     defer { replacement.close() }
-                    try await Task.detached { try replacement.restore(recovery) }.value
+                    try await replacement.restore(recovery)
                 } catch { return error.localizedDescription }
             }
             return error.localizedDescription
@@ -258,7 +323,7 @@ final class LDACOwnerOutput {
 
     private func request(_ command: LDACOwnerCommand) async throws {
         guard let channel else { throw LDACOwnerError(message: String(localized: "LDAC playback stopped unexpectedly. Try again.")) }
-        let controls = try await Task.detached { try channel.request(command) }.value
+        let controls = try await channel.request(command)
         try Task.checkCancellation()
         if let controls = channel.currentControls ?? controls { self.controls = controls }
     }

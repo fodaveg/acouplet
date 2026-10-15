@@ -101,7 +101,7 @@ final class LDACNativeOutput {
     func configure(volume: Int, range: ClosedRange<Int>, preservingUserChange: Bool = false) throws {
         if model == "delayed" || model == "hung" || model == "parent-hung" || model == "ordering" {
             SwiftRecord("owner-configure-start")
-            usleep(model == "delayed" || model == "ordering" ? 500_000 : 10_000_000)
+            usleep(model == "delayed" || model == "ordering" ? 500_000 : model == "hung" ? 800_000 : 10_000_000)
             SwiftRecord("owner-configure-end")
         }
         _ = controls.update(volume: volume, range: range)
@@ -334,23 +334,28 @@ enum Check {
             SwiftRecord("stop-admitted")
             do { try await pending.value; fatalError("Delayed request was admitted after cancellation or timeout") }
             catch is CancellationError { precondition(mode == "delayed") }
-            catch { precondition(mode == "hung" && error.localizedDescription == "LDAC did not stop completely.") }
+            catch {
+                // A late configure is not fatal: the owner stays up and the stop already sent still completes (L12).
+                precondition(mode == "hung" && error.localizedDescription == "The LDAC audio output did not respond in time.")
+                precondition(!output.ownerEnded, "A late configure shut the owner down")
+                SwiftRecord("configure-timed-out")
+            }
         }
         if mode == "malformed" { try output.malformed() }
         if mode == "oversized" { try output.oversized() }
         if mode == "eof" { output.endInput() }
-        if ["owner-crash", "malformed", "oversized", "eof", "owner-term", "hung"].contains(mode) {
+        if ["owner-crash", "malformed", "oversized", "eof", "owner-term"].contains(mode) {
             while !completed { try await Task.sleep(for: .milliseconds(5)) }
             while !output.ownerEnded { try await Task.sleep(for: .milliseconds(5)) }
             let error = await output.restoreAndRelease()
-            precondition((error != nil) == ["owner-crash", "hung"].contains(mode))
+            precondition((error != nil) == (mode == "owner-crash"))
             SwiftRecord("app-complete")
             return
         }
         if ["crash", "inherited", "missing", "changed"].contains(mode) {
             while true { try await Task.sleep(for: .seconds(1)) }
         }
-        if mode != "delayed" { session.stop(restoreAudio: true) }
+        if mode != "delayed" && mode != "hung" { session.stop(restoreAudio: true) }
         while !completed { try await Task.sleep(for: .milliseconds(5)) }
         if mode == "gap" {
             SwiftRecord("app-gap")
@@ -471,9 +476,11 @@ with tempfile.TemporaryDirectory(prefix='acouplet-owner-check-') as temporary:
             assert state['lease'] is False
             routes = list(state['routes'].values())
             assert 8 in routes, 'Independent system-sound choice was replaced'
-            assert state['mutes'] == ([] if mode in ['slow', 'cancel', 'claimed', 'missing', 'changed', 'owner-crash', 'hung', 'ordering'] else [6]), state
+            assert state['mutes'] == ([] if mode in ['slow', 'cancel', 'claimed', 'missing', 'changed', 'owner-crash', 'ordering'] else [6]), (mode, state, lines)
             assert (9 if mode == 'changed' else 5 if mode == 'missing' else 6) in routes
-            if mode in ['owner-crash', 'hung']:
+            if mode == 'hung':
+                assert 'configure-timed-out' in lines and 'owner-recovery' not in lines, 'A late configure shut the owner down'
+            if mode == 'owner-crash':
                 assert 'owner-recovery' in lines
             elif helpers:
                 assert lines.index('children-reaped') < lines.index('output restoring')
