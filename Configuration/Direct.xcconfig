@@ -1,6 +1,11 @@
 ACOUPLET_SPARKLE_PUBLIC_KEY = kWAD8GKHAOt8Kdk3e6g8wRvCz6q3ckD1Y3oHmoHBdWI=
 ACOUPLET_SPARKLE_ENABLED_NO = YES
 ACOUPLET_DISTRIBUTION = production
+// Development builds (Debug and package.sh --local) get no update feed: upstream's releases, signed with
+// the same key, would replace a local build of the fork. `$()` keeps `//` from starting a comment.
+ACOUPLET_SPARKLE_FEED_URL_production = https:/$()/baglayan.dev/updates/appcast.xml
+ACOUPLET_SPARKLE_FEED_URL_development =
+ACOUPLET_SPARKLE_FEED_URL = $(ACOUPLET_SPARKLE_FEED_URL_$(ACOUPLET_DISTRIBUTION))
 ACOUPLET_SPARKLE_ENABLED_YES = NO
 ACOUPLET_SPARKLE_ENABLED = $(ACOUPLET_SPARKLE_ENABLED_$(ACOUPLET_PUBLIC_APIS_ONLY))
 ACOUPLET_SWIFT_SPARKLE_YES = ACOUPLET_SPARKLE

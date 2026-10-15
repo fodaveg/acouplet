@@ -315,6 +315,27 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--register-login-item"], defaults: defaults, service: failing), EXIT_FAILURE)
     }
 
+    #if canImport(Sparkle)
+    func testUpdatesStayOffInDevelopmentBuildsAndWithoutAFeed() {
+        let feed = "https://baglayan.dev/updates/appcast.xml"
+        XCTAssertTrue(AppUpdater.updatesEnabled(feed: feed, distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: feed, distribution: "development"),
+                       "A local build of the fork never asks upstream's feed for updates")
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: "", distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: nil, distribution: "production"))
+        XCTAssertFalse(AppUpdater.updatesEnabled(feed: "", distribution: "development"))
+    }
+
+    @MainActor
+    func testThisBuildsInfoPlistMatchesItsUpdatePolicy() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let distribution = info["AcoupletDistribution"] as? String
+        let feed = info["SUFeedURL"] as? String
+        XCTAssertEqual(feed, distribution == "development" ? "" : "https://baglayan.dev/updates/appcast.xml")
+        XCTAssertEqual(AppUpdater().isEnabled, distribution != "development")
+    }
+    #endif
+
     @MainActor
     func testBackgroundServiceModeFollowsThePlistStateNotTheLaunchArguments() throws {
         let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"

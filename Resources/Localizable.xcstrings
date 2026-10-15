@@ -16806,6 +16806,23 @@
           }
         }
       }
+    },
+    "Updates are off in development builds.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Updates are off in development builds."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geliştirme derlemelerinde güncellemeler kapalıdır."
+          }
+        }
+      }
     }
   },
   "version": "1.1"

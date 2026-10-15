@@ -235,13 +235,20 @@ struct SettingsView: View {
                     get: { updater.automaticallyChecksForUpdates },
                     set: { updater.setAutomaticallyChecksForUpdates($0) }
                 ))
+                .disabled(!updater.isEnabled)
                 Toggle("Automatically download and install updates", isOn: Binding(
                     get: { updater.automaticallyDownloadsUpdates },
                     set: { updater.setAutomaticallyDownloadsUpdates($0) }
                 ))
-                .disabled(!updater.allowsAutomaticUpdates)
+                .disabled(!updater.isEnabled || !updater.allowsAutomaticUpdates)
                 Button("Check for Updates…") { updater.checkForUpdates() }
                     .disabled(!updater.canCheckForUpdates)
+                if !updater.isEnabled {
+                    Text("Updates are off in development builds.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("settings.updatesOff")
+                }
             }
             #endif
         }
