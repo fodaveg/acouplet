@@ -186,7 +186,9 @@ static int PriorityIdle(NSString *uid) {
 @end
 
 static int WatchConnection(IOBluetoothDevice *device, ConnectionObserver *observer, NSString *address, NSString *priorityUID, int parentEvents) {
-    printf("CONNECT_READY handle=%04X guarded=1\n", observer.originalHandle);
+    // IOBluetooth reports handle 0000 for every ACL on current macOS, so a zero handle cannot tell connections
+    // apart; say so instead of claiming a guard. The disconnect notification still retires the connection.
+    printf("CONNECT_READY handle=%04X guarded=%d\n", observer.originalHandle, observer.originalHandle != 0);
     BOOL parentExited = NO;
     while (YES) {
         ParentInputEnded();

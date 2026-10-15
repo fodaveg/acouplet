@@ -13,6 +13,7 @@ final class MacAudioRouteTests: XCTestCase {
             "l2capDisconnected for CID: 0x0040",
             "l2capDataInd for CID: 0x0040, len: 0x0002",
             "ACL connected: 02-00-00-00-00-01, result 0",
+            "ACL disconnected: 02-00-00-00-00-01, result 0, reason 10722",
             "Received connection result for \"A2DP Source\" profile on device 02-00-00-00-00-01 result was 0"
         ] {
             XCTAssertTrue(predicate.evaluate(with: ["process": "bluetoothd", "eventMessage": message]))

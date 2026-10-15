@@ -60,6 +60,7 @@ final class Device: ObservableObject {
     var playback: Playback
     var earbudFinder: EarbudFinder?
     var supportsConnectionMode = true
+    var ldacRequiresMultipointOff = false
     let address = "02:00:00:00:00:01"
     @Published var connectionMode: SonyConnectionMode? = .stableConnection
     @Published var connectionTransition: ConnectionTransition?
@@ -160,8 +161,16 @@ final class Controller: ObservableObject {
     var requestedAddress: String? = "02:00:00:00:00:01"
     var isSessionRunning = true
     var isRecovering = true
-    var recoveryPaused = false
-    var recoveryResumeContext: (controller: ObjectIdentifier, observedConnected: Bool, observedDisconnect: Bool)?
+    var recoveryAttempt = 0
+    var retryAfterRestoration = false
+    var isAwaitingAutomaticRetry = false
+    var recoveryTaskID: UUID?
+    var automaticRetryDelay: Duration = .milliseconds(1)
+    var bindingHeldSince: Date?
+    var bindingHoldTask: Task<Void, Never>?
+    var multipointConflictAddress: String?
+    var multipointConflictConfiguration: LDACConfiguration?
+    var multipointShutdownAddress: String?
     var restoreAudioOnStop = true
     var nativeOutput: Output?
     var session: Session?
@@ -203,6 +212,7 @@ final class Controller: ObservableObject {
         }
     }
     func record(_ event: String, reason: String) {}
+    func recordRecovery(_ event: String, reason: String) {}
     func setOutputGain(_ gain: Double) { requestedOutputGain = gain }
     func sessionFinished(_ message: String? = nil, targetDisconnected: Bool = false) {
         finish(message, targetDisconnected: targetDisconnected)
@@ -589,17 +599,26 @@ enum LDACControllerCleanupCheck {
         parked.availabilityChanged()
         precondition(parked.starts == [address], "Ready reconnect did not resume exactly once")
 
-        let retry = Controller()
-        let retryDevice = retry.devices!.controller(for: address)!
-        retry.requestedAddress = address
-        retry.targetAddress = address
-        retry.state = .waitingForDevice
-        retry.recoveryPaused = true
-        retry.recoveryResumeContext = (ObjectIdentifier(retryDevice), true, false)
+        let retryOutput = Output()
+        let retry = Controller(output: retryOutput)
+        retry.suspensionRequested = true
+        retry.retryAfterRestoration = true
+        retry.recoveryAttempt = 1
+        retry.sessionFinished()
+        await waitUntil { retryOutput.continuation != nil }
+        retryOutput.continuation?.resume(returning: nil)
+        await waitUntil { retry.cleanupTask == nil }
+        precondition(retry.state == .waitingForDevice && retry.isAwaitingAutomaticRetry && retry.recoveryTask != nil)
         retry.availabilityChanged()
-        precondition(retry.starts.isEmpty, "Exhausted recovery resumed before a new request")
-        retry.setEnabled(true, forAddress: address)
-        precondition(retry.starts == [address], "Explicit Retry did not resume remembered LDAC intent")
+        precondition(retry.starts.isEmpty, "The fallback resumed LDAC before its retry delay")
+        await waitUntil { retry.recoveryTask == nil }
+        try? await Task.sleep(for: .milliseconds(20))
+        await waitUntil { retry.starts == [address] }
+        precondition(retry.recoveryAttempt == 1, "The automatic retry renewed its own budget")
+        let explicit = Controller()
+        explicit.recoveryAttempt = 1
+        explicit.setEnabled(true, forAddress: address)
+        precondition(explicit.starts == [address] && explicit.recoveryAttempt == 0, "An explicit request did not renew the retry")
 
         let blockers: [(String, (Controller) -> Void)] = [
             ("sleep", { $0.devices!.isSystemSleeping = true }),
@@ -713,7 +732,7 @@ enum LDACControllerCleanupCheck {
         print("PASS actual finder admission: active finding and unconfirmed Stop block LDAC and manual installation; absent or idle finder allows admission")
     }
 }
-'''.replace("__METHODS__", "\n".join(method(name) for name in ["needsStopBeforeTermination", "canResumeRecovery", "deviceUnavailableReason", "canEnable", "refreshDriverState", "updateInstalledDriverIfNeeded", "installDriver", "openDriverInstaller", "setEnabled", "stop", "suspend", "resumeIfReady", "reconcileConnectionPreferences", "forgetConnectionPreference", "scheduleConnectionPreferenceRestoration", "stopSession", "prepareConnectionMode", "waitForConnectionChange", "restoreConnectionMode", "restoreConnectionPreference", "finish", "completeStop"]))
+'''.replace("__METHODS__", "\n".join(method(name) for name in ["needsStopBeforeTermination", "deviceUnavailableReason", "canEnable", "refreshDriverState", "updateInstalledDriverIfNeeded", "installDriver", "openDriverInstaller", "setEnabled", "stop", "suspend", "resumeIfReady", "reconcileConnectionPreferences", "forgetConnectionPreference", "scheduleConnectionPreferenceRestoration", "stopSession", "prepareConnectionMode", "waitForConnectionChange", "restoreConnectionMode", "restoreConnectionPreference", "finish", "completeStop", "scheduleRecovery", "endRetryWait", "cancelAutomaticRetry"]))
 
 with tempfile.TemporaryDirectory(prefix="acouplet-ldac-controller-cleanup-") as directory:
     directory = pathlib.Path(directory)

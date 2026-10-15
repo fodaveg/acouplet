@@ -11267,18 +11267,18 @@
         }
       }
     },
-    "The Bluetooth connection couldn’t keep up. LDAC will reconnect.": {
+    "The Bluetooth connection couldn’t keep up. Ordinary Bluetooth audio is being restored.": {
       "localizations": {
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "Bluetooth bağlantısı yavaşladı. LDAC yeniden bağlanacak."
+            "value": "Bluetooth bağlantısı yavaşladı. Normal Bluetooth sesi geri yükleniyor."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The Bluetooth connection couldn’t keep up. LDAC will reconnect."
+            "value": "The Bluetooth connection couldn’t keep up. Ordinary Bluetooth audio is being restored."
           }
         }
       }
@@ -14304,6 +14304,91 @@
           "stringUnit": {
             "state": "translated",
             "value": "Waiting for headphones…"
+          }
+        }
+      }
+    },
+    "Ordinary audio · retrying LDAC…": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Normal ses · LDAC yeniden deneniyor…"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordinary audio · retrying LDAC…"
+          }
+        }
+      }
+    },
+    "LDAC stopped again because the Bluetooth connection couldn’t keep up. The headphones are using ordinary Bluetooth audio.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth bağlantısı yine yavaşladığı için LDAC durdu. Kulaklıklar normal Bluetooth sesi kullanıyor."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC stopped again because the Bluetooth connection couldn’t keep up. The headphones are using ordinary Bluetooth audio."
+          }
+        }
+      }
+    },
+    "The headphones left Sound Quality mode. LDAC stopped and ordinary Bluetooth audio was restored.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kulaklıklar Ses Kalitesi modundan çıktı. LDAC durdu ve normal Bluetooth sesi geri yüklendi."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The headphones left Sound Quality mode. LDAC stopped and ordinary Bluetooth audio was restored."
+          }
+        }
+      }
+    },
+    "Another device became the headphones’ audio source. LDAC stopped and ordinary Bluetooth audio was restored.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kulaklıkların ses kaynağı başka bir cihaz oldu. LDAC durdu ve normal Bluetooth sesi geri yüklendi."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Another device became the headphones’ audio source. LDAC stopped and ordinary Bluetooth audio was restored."
+          }
+        }
+      }
+    },
+    "The LDAC audio output did not respond in time.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC ses çıkışı zamanında yanıt vermedi."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The LDAC audio output did not respond in time."
           }
         }
       }

@@ -391,11 +391,27 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             && [playback.statusQueryPayload, playback.musicVolumeQueryPayload]
                 .allSatisfy { playbackReads[$0] == nil && !queuedPlaybackQueries.contains($0) }
     }
-    /// EXPERIMENTAL: true while only the "keep current audio source" flag is being written. It leaves the
-    /// selected source untouched, but any unfinished source transition makes `hasCurrentMusicVolumeControl` false.
-    var isChangingSourceKeepingOnly: Bool {
-        guard let transition = sourceTransition else { return false }
-        return transition.requestedKeeping != nil && !transition.isFinished
+    /// Names the unfinished connection, source, device-action or multipoint transition, if any. While one runs,
+    /// `hasCurrentMusicVolumeControl` is false even when the selected source ends up unchanged, so LDAC holds its
+    /// binding and decides with the final values instead of recovering.
+    var pendingControlTransition: String? {
+        if connectionTransition?.isFinished == false { return "connection" }
+        if sourceTransition?.isFinished == false { return sourceTransition?.requestedKeeping != nil ? "source-keeping" : "source" }
+        if deviceActionTransition?.isFinished == false { return "device-action" }
+        if multipointTransition?.isFinished == false { return "multipoint" }
+        return nil
+    }
+    /// The device that the latest source switch requested in Acouplet selects, unless that switch failed. Tells a
+    /// switch the user asked for apart from another multipoint device taking over playback by itself.
+    var requestedSourceSwitchAddress: String? {
+        guard let transition = sourceTransition, transition.requestedKeeping == nil, transition.phase != .failed else { return nil }
+        return transition.targetAddress
+    }
+    /// True when a connection-mode change is leaving Sound Quality, or has left it, which LDAC requires.
+    var isLeavingLDACConnectionMode: Bool {
+        guard supportsConnectionMode else { return false }
+        if let transition = connectionTransition, !transition.isFinished { return transition.targetMode != .soundQuality }
+        return connectionMode.map { $0 != .soundQuality } ?? false
     }
     func hasCurrentMusicSourceContext(for localAddress: @autoclosure () -> String?) -> Bool {
         guard hasCurrentTable2Capabilities else { return false }
@@ -865,8 +881,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var deviceActionRecoveryAttempts = 0
     private var nextRetryDate: Date?
     private var syncPollCount = 0
-    /// EXPERIMENTAL: set by LDACController while LDAC is streaming to these headphones.
+    /// Set by LDACController while LDAC is streaming to these headphones. The full settings refresh every 15 s
+    /// interrupted the stream, so while it is set the poll only reads the battery every `ldacBatteryPollInterval` ticks.
     var isLDACStreaming = false
+    private var ldacBatteryPollCount = 0
+    private static let ldacBatteryPollInterval = 20
     private var supportsTable2 = false
     private var supportFunctionsReadTransmitted = false
     @Published private var discoveryReads: [[UInt8]: DiscoveryRead] = [:]
@@ -1820,15 +1839,28 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         updateRetryCountdown()
         refresh(shouldOpenLink: reconnectAutomatically)
         guard stage == .ready else { return }
+        if isLDACStreaming {
+            // The poll ticks every 3 s: a battery read every 60 s keeps the menu current without the settings burst.
+            syncPollCount = 0
+            ldacBatteryPollCount += 1
+            if ldacBatteryPollCount >= Self.ldacBatteryPollInterval {
+                ldacBatteryPollCount = 0
+                requestStreamingBattery()
+            }
+            return
+        }
+        ldacBatteryPollCount = 0
         syncPollCount += 1
         if syncPollCount >= 5 {
             syncPollCount = 0
-            if isLDACStreaming {
-                Self.logger.info("settings poll skipped: LDAC streaming")
-            } else {
-                requestCurrentSettings()
-            }
+            requestCurrentSettings()
         }
+    }
+
+    private func requestStreamingBattery() {
+        guard powerOffState == nil, !isRunningHeadphoneTest, connectionTransition?.isFinished != false, sourceTransition?.isFinished != false,
+              multipointTransition?.isFinished != false, deviceActionTransition?.isFinished != false else { return }
+        requestBattery()
     }
 
     private func requestCurrentSettings() {

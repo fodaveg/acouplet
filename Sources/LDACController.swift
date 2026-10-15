@@ -11,6 +11,8 @@ final class LDACController: ObservableObject {
     @Published private(set) var targetAddress: String?
     @Published private(set) var isSessionRunning = false
     @Published private(set) var isRecovering = false
+    /// True while ordinary Bluetooth audio plays after a recoverable abort and the single automatic LDAC retry waits.
+    @Published private(set) var isAwaitingAutomaticRetry = false
     @Published private(set) var audioCaptureAccess: LDACAudioCaptureAccess = .unchecked
     @Published private(set) var driverState: LDACDriverInstaller.State
     @Published private(set) var driverInstallationError: String?
@@ -42,7 +44,7 @@ final class LDACController: ObservableObject {
         }
     }
 
-    /// EXPERIMENTAL: tells the Sony controller to skip periodic settings reads while LDAC streams.
+    /// Tells the Sony controller to reduce its periodic reads to a battery poll while LDAC streams.
     private func syncStreamingFlag() {
         if case .active = state { headphones?.isLDACStreaming = true } else { headphones?.isLDACStreaming = false }
     }
@@ -60,10 +62,18 @@ final class LDACController: ObservableObject {
     private var volumeTask: Task<Void, Never>?
     private var volumeTaskID: UUID?
     private var cleanupTask: Task<Void, Never>?
+    /// Waits out `automaticRetryDelay` before the single automatic LDAC retry; `recoveryTaskID` identifies the current wait.
     private var recoveryTask: Task<Void, Never>?
+    private var recoveryTaskID: UUID?
+    /// Automatic retries used by the current LDAC request. Only one is allowed until playback stays stable for 30 s.
     private var recoveryAttempt = 0
-    private var recoveryPaused = false
-    private var recoveryResumeContext: (controller: ObjectIdentifier, observedConnected: Bool, observedDisconnect: Bool)?
+    /// Set when a recoverable abort falls back to ordinary audio with a retry still available; `finish` schedules it.
+    private var retryAfterRestoration = false
+    private var automaticRetryDelay: Duration = .seconds(10)
+    /// When the current binding hold began; a hold without a pending transition ends in recovery after `bindingHoldLimit`.
+    private var bindingHeldSince: Date?
+    private var bindingHoldTask: Task<Void, Never>?
+    private let bindingHoldLimit: TimeInterval = 10
     private var restoreAudioOnStop = true
     private var stableSince: Date?
     private var pendingVolume: Int?
@@ -133,20 +143,29 @@ final class LDACController: ObservableObject {
         state = .connecting
     }
 
-    func simulateRecoveryTimeout(stableSince: Date? = nil, at date: Date = Date()) -> TimeInterval? {
+    /// Records helper launches and session starts instead of spawning the owner process, so tests can drive
+    /// `sessionFinished` without Bluetooth or the Core Audio driver.
+    var simulatedLaunches: [(address: String, restoringOnly: Bool)]?
+    var simulatedStarts: [String]?
+
+    func simulateHelpers(retryDelay: Duration = .milliseconds(10)) {
+        simulatedLaunches = []
+        simulatedStarts = []
+        automaticRetryDelay = retryDelay
+    }
+
+    /// Delivers a session completion as the owner would, after a stream that was stable since `stableSince`.
+    func simulateSessionFinished(_ completion: LDACNativeSession.Completion, stableSince: Date? = nil, at date: Date = Date()) {
+        guard let address = targetAddress else { return }
         self.stableSince = stableSince
-        beginRecovery(reason: "simulated control timeout", at: date)
-        let delay = nextRecoveryDelay()
-        if delay == nil { finish(nil) }
-        return delay
+        if completion.canRetry, !isRecovering { beginRecovery(reason: "simulated connection loss", at: date) }
+        session = nil
+        sessionFinished(completion, address: address)
     }
 
     var simulatedRequestedAddress: String? { requestedAddress }
     var simulatedRestoresAudioOnStop: Bool { restoreAudioOnStop }
-
-    func simulatedCanResumeRecovery(with headphones: SonyHeadphonesController) -> Bool {
-        canResumeRecovery(with: headphones)
-    }
+    var simulatedRecoveryAttempt: Int { recoveryAttempt }
     #endif
 
     var canStartOrInstallDriver: Bool {
@@ -217,7 +236,7 @@ final class LDACController: ObservableObject {
     func setEnabled(_ enabled: Bool, forAddress address: String, configuration: LDACConfiguration? = nil) {
         guard let address = SonyBLEIdentity.normalizedAddress(address) else { return }
         if enabled {
-            guard requestedAddress != address || (recoveryPaused && !isSessionRunning) else { return }
+            guard requestedAddress != address else { return }
             guard preferenceRestoreTasks[address] == nil else { return }
             guard deviceUnavailableReason(forAddress: address) == nil else { return }
             if let configuration { requestedConfiguration = configuration }
@@ -242,13 +261,15 @@ final class LDACController: ObservableObject {
                 return
             }
             requestedAddress = address
+            recoveryAttempt = 0
+            cancelAutomaticRetry()
             if !isSessionRunning { start(address) }
             else { stopSession(reason: "target changed") }
         } else if targetAddress == address || requestedAddress == address {
             requestedAddress = nil
             suspensionRequested = false
             if isSessionRunning { stopSession(reason: "user disabled LDAC") }
-            else { state = .off; targetAddress = nil; resumeIfReady() }
+            else { cancelAutomaticRetry(); state = .off; targetAddress = nil; resumeIfReady() }
         }
     }
 
@@ -305,7 +326,7 @@ final class LDACController: ObservableObject {
             stopCompletions.append(completion)
             objectWillChange.send()
         }
-        if !isSessionRunning { state = .off; targetAddress = nil; resumeIfReady(); completeStop() }
+        if !isSessionRunning { cancelAutomaticRetry(); state = .off; targetAddress = nil; resumeIfReady(); completeStop() }
         else { stopSession(restoreAudio: restoreAudio, reason: reason) }
     }
 
@@ -389,10 +410,9 @@ final class LDACController: ObservableObject {
             deferredConnectionModes[address] = nil
             scheduleConnectionPreferenceRestoration(headphones, address: address, request: request)
         }
-        guard state == .waitingForDevice, !isSessionRunning, cleanupTask == nil,
+        guard state == .waitingForDevice, !isSessionRunning, cleanupTask == nil, recoveryTask == nil,
               let address = requestedAddress, preferenceRestoreTasks[address] == nil,
               let headphones = devices?.controller(for: address),
-              canResumeRecovery(with: headphones),
               devices?.selectedAddress == address, headphones.isDeviceConnected,
               deviceUnavailableReason(forAddress: address) == nil, !headphones.ldacRequiresMultipointOff,
               let resumeOutputUID, audioRoute?.route?.uid == resumeOutputUID,
@@ -412,12 +432,11 @@ final class LDACController: ObservableObject {
         suspensionRequested = false
         resumeOutputUID = audioRoute?.route?.uid
         isRecovering = false
-        recoveryAttempt = 0
-        recoveryPaused = false
-        recoveryResumeContext = nil
+        isAwaitingAutomaticRetry = false
+        bindingHeldSince = nil
         restoreAudioOnStop = true
         isSessionRunning = true
-        record("requested", reason: "enabled")
+        record("requested", reason: "enabled; automaticRetriesUsed=\(recoveryAttempt)")
         let identifier = sessionID
         outputID = identifier
         let output = LDACOwnerOutput(id: sessionID, address: address) { [weak self] result in
@@ -440,6 +459,12 @@ final class LDACController: ObservableObject {
             }
         }
         nativeOutput = output
+        #if DEBUG
+        if simulatedStarts != nil {
+            simulatedStarts?.append(address)
+            return
+        }
+        #endif
         startTask = Task { [weak self] in
             guard let self, self.sessionID == identifier else { return }
             do {
@@ -667,6 +692,12 @@ final class LDACController: ObservableObject {
         if !restoringOnly { audioCaptureAccess = .checking }
         let identifier = sessionID
         record("helpers-started", reason: restoringOnly ? "restoring ordinary Bluetooth audio" : "checking targeted audio permission")
+        #if DEBUG
+        if simulatedLaunches != nil {
+            simulatedLaunches?.append((address, restoringOnly))
+            return
+        }
+        #endif
         let output = nativeOutput!
         let session = LDACOwnerSession(id: identifier, output: output, configuration: requestedConfiguration,
                                        recoveryAttempt: isRecovering, restoringOnly: restoringOnly) { [weak self] event in
@@ -740,22 +771,52 @@ final class LDACController: ObservableObject {
                 else { self.session?.stop(restoreAudio: self.restoreAudioOnStop) }
             case let .finished(completion):
                 self.session = nil
-                if completion.waitForReconnect, completion.canRetry, self.requestedAddress == address {
-                    self.suspensionRequested = true
-                    self.finish(nil, targetDisconnected: true)
-                } else if completion.canRetry, self.requestedAddress == address, self.state != .stopping {
-                    if !self.isRecovering { self.beginRecovery(reason: completion.message ?? "Bluetooth connection lost") }
-                    self.scheduleRecovery(address, targetDisconnected: completion.targetDisconnected)
-                } else if completion.canRetry, !completion.waitForReconnect, self.restoreAudioOnStop {
-                    self.sessionID = UUID()
-                    self.launch(address, restoringOnly: true)
-                } else {
-                    self.finish(completion.requiresAttention ? completion.message : nil, targetDisconnected: completion.targetDisconnected)
-                }
+                self.sessionFinished(completion, address: address)
             }
         }
         self.session = session
         session.start()
+    }
+
+    /// Routes a finished LDAC or restoration session. A recoverable abort always returns the headphones to
+    /// ordinary Bluetooth audio first (D1); the headphones leaving on their own waits for them to return.
+    private func sessionFinished(_ completion: LDACNativeSession.Completion, address: String) {
+        if completion.waitForReconnect, completion.canRetry, requestedAddress == address {
+            suspensionRequested = true
+            finish(nil, targetDisconnected: true)
+        } else if completion.canRetry, requestedAddress == address, state != .stopping {
+            if !isRecovering { beginRecovery(reason: completion.message ?? "Bluetooth connection lost") }
+            fallBackToOrdinaryAudio(address, targetDisconnected: completion.targetDisconnected)
+        } else if completion.canRetry, !completion.waitForReconnect, restoreAudioOnStop {
+            sessionID = UUID()
+            launch(address, restoringOnly: true)
+        } else {
+            finish(completion.requiresAttention ? completion.message : nil, targetDisconnected: completion.targetDisconnected)
+        }
+    }
+
+    /// Returns the headphones to ordinary Bluetooth audio after a recoverable abort (D1). The first abort of a
+    /// request schedules one LDAC retry after `automaticRetryDelay`; an abort of that retry leaves ordinary audio
+    /// playing and tells the user. When LDAC had disconnected the headphones, the restore helper reconnects them;
+    /// otherwise their ordinary connection is still up and releasing the output is enough.
+    private func fallBackToOrdinaryAudio(_ address: String, targetDisconnected: Bool) {
+        if recoveryAttempt >= 1 {
+            recordRecovery("retry-exhausted", reason: "attempts=\(recoveryAttempt) targetDisconnected=\(targetDisconnected)")
+            volumeError = String(localized: "LDAC stopped again because the Bluetooth connection couldn’t keep up. The headphones are using ordinary Bluetooth audio.")
+            requestedAddress = nil
+            retryAfterRestoration = false
+        } else {
+            recoveryAttempt += 1
+            suspensionRequested = true
+            retryAfterRestoration = true
+            recordRecovery("native-fallback", reason: "attempt=\(recoveryAttempt) targetDisconnected=\(targetDisconnected)")
+        }
+        if targetDisconnected {
+            sessionID = UUID()
+            launch(address, restoringOnly: true)
+        } else {
+            finish(nil)
+        }
     }
 
     private var hasMusicVolumeForHandoff: Bool {
@@ -785,11 +846,44 @@ final class LDACController: ObservableObject {
         }
     }
 
-    private var bindingIsCurrent: Bool {
-        guard let headphones, hasOwnedMusicContext || headphones.isChangingSourceKeepingOnly else { return false }
-        return headphones.notificationSession == controlSession
-            && headphones.multipoint.selectedSource?.address == sourceAddress
-            && headphones.playback.musicVolumeRange == volumeRange
+    private var bindingIsCurrent: Bool { bindingCheck == .current }
+
+    /// How the headphones' current state relates to the volume binding taken at `volume-bound`.
+    private enum BindingCheck: Equatable {
+        /// Same control session, source and range, with fresh volume controls.
+        case current
+        /// Nothing that LDAC depends on changed, but freshness was lost or a transition that may keep the
+        /// selected source is still running (keeping, inventory reread, another device's connection, multipoint).
+        case held(String, transition: Bool)
+        /// The selected source moved to another device, or the connection mode is leaving Sound Quality (D5).
+        case sourceChanged(String)
+        /// The control connection itself changed, so the binding cannot be trusted any more.
+        case lost(String)
+    }
+
+    /// Classifies the binding, naming the clause that decided it so that recovery logs say which one failed.
+    /// Identity, connection, control session and raw transport are always checked; only freshness and
+    /// source-keeping transitions are tolerated while the values LDAC was bound to stay the same (L4, L5).
+    private var bindingCheck: BindingCheck {
+        guard let headphones, let address = targetAddress, devices?.controller(for: address) === headphones,
+              SonyBLEIdentity.normalizedAddress(headphones.address) == address else { return .lost("controller-changed") }
+        guard headphones.isDeviceConnected else { return .lost("device-disconnected") }
+        guard controlSession != nil, headphones.notificationSession == controlSession else { return .lost("control-session-changed") }
+        guard headphones.playback.generation != .v1 || transportFormat != nil else { return .lost("raw-transport-missing") }
+        if headphones.isLeavingLDACConnectionMode { return .sourceChanged("connection-mode") }
+        if let bound = sourceAddress, let selected = headphones.multipoint.selectedSource?.address, selected != bound,
+           !headphones.multipoint.inventoryIsStale {
+            return .sourceChanged("selected-source")
+        }
+        if let range = headphones.playback.musicVolumeRange, range != volumeRange { return .lost("volume-range-changed") }
+        if let transition = headphones.pendingControlTransition { return .held("transition=\(transition)", transition: true) }
+        if headphones.multipoint.inventoryIsStale { return .held("inventory-stale", transition: false) }
+        if headphones.multipoint.selectedSource?.address != sourceAddress { return .held("source-unconfirmed", transition: false) }
+        if headphones.playback.musicVolumeRange == nil { return .held("volume-range-unknown", transition: false) }
+        guard hasOwnedMusicContext else {
+            return .held(headphones.hasCurrentMusicVolumeControl ? "source-context-stale" : "volume-controls-stale", transition: false)
+        }
+        return .current
     }
 
     private var musicControlStatus: String {
@@ -841,7 +935,18 @@ final class LDACController: ObservableObject {
                         if self.isRecovering || self.pendingVolume == nil, let output = self.nativeOutput { self.pendingVolume = output.controls.volume(in: range) }
                     }
                     if self.controlSession != nil {
-                        guard self.bindingIsCurrent else { throw ControlError(String(localized: "The headphone audio source or connection changed. LDAC stopped.")) }
+                        switch self.bindingCheck {
+                        case .current: break
+                        case .held:
+                            try await Task.sleep(for: .milliseconds(100))
+                            continue
+                        case let .sourceChanged(reason):
+                            self.stopForChange(reason)
+                            return
+                        case let .lost(reason):
+                            self.recordRecovery("binding-lost", reason: reason)
+                            throw ControlError(String(localized: "The headphone audio source or connection changed. LDAC stopped."))
+                        }
                         self.sendPendingVolume()
                         if self.pendingVolume == nil, self.volumeTask == nil,
                            self.headphones?.canControlMusicVolume == true,
@@ -894,20 +999,79 @@ final class LDACController: ObservableObject {
             return
         }
         if hasOtherMusicSource {
-            suspend(restoreAudio: true, reason: "another headphone music source is active")
+            stopForChange("other-music-source")
             return
         }
         guard controlSession != nil else { return }
-        guard bindingIsCurrent else {
-            beginRecovery(reason: String(localized: "The headphone controls temporarily disconnected."))
-            session?.recoverConnection(reason: String(localized: "The headphone controls temporarily disconnected."))
+        switch bindingCheck {
+        case .current:
+            if bindingHeldSince != nil { recordRecovery("binding-restored", reason: "current") }
+            bindingHeldSince = nil
+            bindingHoldTask?.cancel()
+            bindingHoldTask = nil
+        case let .held(reason, transition):
+            holdBinding(reason, transition: transition)
+            return
+        case let .sourceChanged(reason):
+            stopForChange(reason)
+            return
+        case let .lost(reason):
+            recoverBinding(reason)
             return
         }
-        if pendingVolume == nil, volumeTask == nil, let headphones,
-           volumeRange != nil, let volume = headphones.playback.volume {
+        // Only a volume that differs from the Mac's own controls is news. Re-confirming the same volume on every
+        // `objectWillChange` sent an owner request each time and caused the `volume-confirmed` bursts (L6).
+        if pendingVolume == nil, volumeTask == nil, let headphones, let range = volumeRange,
+           let volume = headphones.playback.volume, let output = nativeOutput, output.controls.volume(in: range) != volume {
             pendingVolume = volume
         }
         sendPendingVolume()
+    }
+
+    /// Keeps LDAC playing while the binding is only held. Unfinished transitions hold it for as long as they run;
+    /// lost freshness alone gets `bindingHoldLimit` seconds to return before LDAC recovers (L4).
+    private func holdBinding(_ reason: String, transition: Bool, at date: Date = Date()) {
+        if bindingHeldSince == nil { recordRecovery("binding-held", reason: reason) }
+        if transition || bindingHeldSince == nil { bindingHeldSince = date }
+        guard let since = bindingHeldSince else { return }
+        let remaining = bindingHoldLimit - date.timeIntervalSince(since)
+        guard remaining > 0 else {
+            recoverBinding("binding-hold-expired \(reason)")
+            return
+        }
+        guard bindingHoldTask == nil else { return }
+        let identifier = sessionID
+        bindingHoldTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(remaining)) }
+            catch { return }
+            guard let self, self.sessionID == identifier else { return }
+            self.bindingHoldTask = nil
+            self.controlsChanged()
+        }
+    }
+
+    /// The control connection changed under LDAC: recover, which returns the headphones to ordinary audio (D1).
+    private func recoverBinding(_ reason: String) {
+        recordRecovery("binding-lost", reason: reason)
+        let message = String(localized: "The headphone controls temporarily disconnected.")
+        beginRecovery(reason: "\(reason): \(message)")
+        session?.recoverConnection(reason: message)
+    }
+
+    /// A source switch requested in Acouplet, or a connection-mode change, ends LDAC with a notice; stopping restores
+    /// ordinary audio (D5). Any other move of the selected source is another multipoint device playing, which is
+    /// usually brief (a phone notification): LDAC suspends with ordinary audio and resumes once the Mac is the source.
+    private func stopForChange(_ reason: String) {
+        if reason != "connection-mode", let selected = headphones?.multipoint.selectedSource?.address,
+           headphones?.requestedSourceSwitchAddress != selected {
+            recordRecovery("source-suspended", reason: reason)
+            suspend(restoreAudio: true, reason: "another headphone music source is active")
+            return
+        }
+        recordRecovery("source-changed", reason: reason)
+        fail(reason == "connection-mode"
+             ? String(localized: "The headphones left Sound Quality mode. LDAC stopped and ordinary Bluetooth audio was restored.")
+             : String(localized: "Another device became the headphones’ audio source. LDAC stopped and ordinary Bluetooth audio was restored."))
     }
 
     private func sendPendingVolume() {
@@ -926,6 +1090,10 @@ final class LDACController: ObservableObject {
             do {
                 while let volume = self.pendingVolume {
                     try Task.checkCancellation()
+                    if case .held = self.bindingCheck {
+                        try await Task.sleep(for: .milliseconds(100))
+                        continue
+                    }
                     guard self.bindingIsCurrent, let headphones = self.headphones,
                           self.volumeRange?.contains(volume) == true else {
                         throw ControlError("The headphone music volume controls became unavailable. LDAC stopped.", userFacing: String(localized: "The headphone volume controls became unavailable. LDAC stopped."))
@@ -947,22 +1115,43 @@ final class LDACController: ObservableObject {
                         }
                     }
                     try Task.checkCancellation()
-                    guard self.sessionID == identifier, self.bindingIsCurrent, headphones.playback.volume == volume else {
+                    let confirmedBinding: Bool
+                    switch self.bindingCheck {
+                    case .current, .held: confirmedBinding = true
+                    case .sourceChanged, .lost: confirmedBinding = false
+                    }
+                    guard self.sessionID == identifier, confirmedBinding, headphones.playback.volume == volume else {
                         throw ControlError("The headphones did not confirm the requested native volume. LDAC stopped.", userFacing: String(localized: "The headphones did not confirm the requested volume. LDAC stopped."))
                     }
                     self.record("volume-confirmed", reason: "confirmed=\(volume)")
-                    if self.pendingVolume == nil, let range = self.volumeRange {
-                        try await self.nativeOutput?.configure(volume: volume, range: range)
+                    if self.pendingVolume == nil, let range = self.volumeRange, let output = self.nativeOutput,
+                       output.controls.volume(in: range) != volume {
+                        do { try await output.configure(volume: volume, range: range) }
+                        catch is LDACOwnerTimeoutError {
+                            // A late owner is not a failure (L12): the Mac controls still differ, so the next
+                            // change notification queues this volume again.
+                            self.record("volume-configure-late", reason: "confirmed=\(volume)")
+                        }
                         try Task.checkCancellation()
                     }
                 }
             } catch is CancellationError {
             } catch {
-                guard self.sessionID == identifier, self.volumeTaskID == volumeIdentifier else { return }
-                if !self.bindingIsCurrent, !self.hasOtherMusicSource, self.state != .stopping {
-                    self.beginRecovery(reason: error.localizedDescription)
-                    self.session?.recoverConnection(reason: error.localizedDescription)
-                } else { self.fail(error.localizedDescription) }
+                guard self.sessionID == identifier, self.volumeTaskID == volumeIdentifier, self.state != .stopping else { return }
+                switch self.bindingCheck {
+                case let .sourceChanged(reason): self.stopForChange(reason)
+                case let .lost(reason): self.recoverBinding("\(reason) after volume error")
+                case .held:
+                    // A held binding is not a failure: keep LDAC and retry the Mac's volume once it is current.
+                    self.record("volume-deferred", reason: error.localizedDescription)
+                    if self.pendingVolume == nil, let range = self.volumeRange, let output = self.nativeOutput {
+                        self.pendingVolume = output.controls.volume(in: range)
+                    }
+                    self.volumeTask = nil
+                    self.volumeTaskID = nil
+                    self.controlsChanged()
+                case .current: self.fail(error.localizedDescription)
+                }
             }
         }
     }
@@ -984,7 +1173,7 @@ final class LDACController: ObservableObject {
 
     private func beginRecovery(reason: String, at date: Date = Date()) {
         guard requestedAddress == targetAddress, requestedAddress != nil, state != .stopping else { return }
-        record("recovering", reason: reason)
+        recordRecovery("recovering", reason: reason)
         if let stableSince, date.timeIntervalSince(stableSince) >= 30 { recoveryAttempt = 0 }
         stableSince = nil
         isRecovering = true
@@ -997,81 +1186,57 @@ final class LDACController: ObservableObject {
         volumeTask?.cancel()
         volumeTask = nil
         volumeTaskID = nil
+        bindingHoldTask?.cancel()
+        bindingHoldTask = nil
+        bindingHeldSince = nil
         controlSession = nil
         sourceAddress = nil
         transportFormat = nil
     }
 
-    private func nextRecoveryDelay() -> TimeInterval? {
-        guard recoveryAttempt < 2 else {
-            recoveryPaused = true
-            suspensionRequested = true
-            return nil
-        }
-        let delay = ReconnectBackoff.delay(forAttempt: recoveryAttempt)
-        recoveryAttempt += 1
-        return delay
-    }
-
-    private func canResumeRecovery(with headphones: SonyHeadphonesController) -> Bool {
-        guard recoveryPaused else { return true }
-        let controller = ObjectIdentifier(headphones)
-        let connected = isClassicConnected(headphones.address)
-        guard let context = recoveryResumeContext, context.controller == controller else {
-            recoveryResumeContext = (controller, connected, false)
-            return false
-        }
-        let disconnected = context.observedDisconnect || (context.observedConnected && !connected)
-        recoveryResumeContext = (controller, context.observedConnected || connected, disconnected)
-        return connected && disconnected
-    }
-
-    private func scheduleRecovery(_ address: String, targetDisconnected: Bool) {
+    /// Waits `automaticRetryDelay` with ordinary audio playing, then lets `resumeIfReady` start the single LDAC
+    /// retry as soon as the headphones, source and Mac output allow it. Every exit clears `recoveryTask` (L10).
+    private func scheduleRecovery(_ address: String) {
         guard recoveryTask == nil else { return }
-        guard let delay = nextRecoveryDelay() else {
-            stopSession(reason: "automatic recovery attempts exhausted")
-            return
-        }
-        let identifier = sessionID
-        record("retry-scheduled", reason: "delay=\(delay)")
+        let taskID = UUID()
+        recoveryTaskID = taskID
+        isAwaitingAutomaticRetry = true
+        recordRecovery("retry-scheduled", reason: "delay=\(automaticRetryDelay) attempt=\(recoveryAttempt)")
         recoveryTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(delay))
-                guard let self, self.sessionID == identifier, self.requestedAddress == address,
-                      self.isRecovering, self.state != .stopping, let output = self.nativeOutput else { return }
-                try await output.validateForRecovery()
-                if self.hasOtherMusicSource {
-                    self.suspend(restoreAudio: true, reason: "another headphone music source is active")
-                    return
-                }
-                try await output.prepareForReconnect()
-                try Task.checkCancellation()
-                guard self.sessionID == identifier, self.state != .stopping else { return }
-                guard self.hasMusicVolumeForHandoff else {
-                    self.suspensionRequested = true
-                    self.finish(nil, targetDisconnected: targetDisconnected)
-                    return
-                }
-                self.initialReadbackID = self.headphones?.musicVolumeReadbackID
-                self.recoveryTask = nil
-                self.sessionID = UUID()
-                self.requestedOutputGain = 0
-                self.launch(address)
-            } catch is CancellationError {
-            } catch {
-                guard let self, self.sessionID == identifier else { return }
-                self.recoveryTask = nil
-                self.fail(error.localizedDescription)
-            }
+            defer { self?.endRetryWait(taskID) }
+            guard let delay = self?.automaticRetryDelay else { return }
+            do { try await Task.sleep(for: delay) }
+            catch { return }
+            guard let self else { return }
+            self.endRetryWait(taskID)
+            guard self.requestedAddress == address, self.state == .waitingForDevice, !self.isSessionRunning else { return }
+            self.recordRecovery("retry-due", reason: "attempt=\(self.recoveryAttempt)")
+            self.resumeIfReady()
         }
+    }
+
+    /// Clears the retry wait identified by `taskID` unless a newer one replaced it.
+    private func endRetryWait(_ taskID: UUID) {
+        guard recoveryTaskID == taskID else { return }
+        recoveryTask = nil
+        recoveryTaskID = nil
+        isAwaitingAutomaticRetry = false
+    }
+
+    private func cancelAutomaticRetry() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryTaskID = nil
+        isAwaitingAutomaticRetry = false
     }
 
     private func stopSession(restoreAudio: Bool = true, reason: String) {
         record("stopping", reason: "\(reason); restoreAudio=\(restoreAudio) usable=\(usable) requestedGain=\(requestedOutputGain); \(musicControlStatus)")
         restoreAudioOnStop = restoreAudioOnStop && restoreAudio
         guard cleanupTask == nil else { return }
-        recoveryTask?.cancel()
-        recoveryTask = nil
+        cancelAutomaticRetry()
+        bindingHoldTask?.cancel()
+        bindingHoldTask = nil
         state = .stopping
         usable = false
         nativeOutput?.silence()
@@ -1095,8 +1260,10 @@ final class LDACController: ObservableObject {
         record("restoring", reason: "raw=\(message ?? "clean") coordinator=\(volumeError ?? "none")")
         state = .stopping
         usable = false
-        recoveryTask?.cancel()
-        recoveryTask = nil
+        cancelAutomaticRetry()
+        bindingHoldTask?.cancel()
+        bindingHoldTask = nil
+        bindingHeldSince = nil
         readinessTask?.cancel()
         readinessTask = nil
         volumeTask?.cancel()
@@ -1143,16 +1310,16 @@ final class LDACController: ObservableObject {
                 }
             self.volumeError = nil
             self.cleanupTask = nil
+            let retry = self.retryAfterRestoration
+            self.retryAfterRestoration = false
             if !messages.isEmpty {
                 self.requestedAddress = nil
                 self.state = .failed(messages.joined(separator: " "))
             } else if let next = self.requestedAddress {
                 if self.suspensionRequested {
-                    if self.recoveryPaused, let headphones = self.devices?.controller(for: next) {
-                        self.recoveryResumeContext = (ObjectIdentifier(headphones), self.isClassicConnected(next), false)
-                    }
                     self.targetAddress = next
                     self.state = .waitingForDevice
+                    if retry { self.scheduleRecovery(next) }
                 } else { self.start(next) }
             } else {
                 self.targetAddress = nil
@@ -1165,6 +1332,13 @@ final class LDACController: ObservableObject {
 
     private func record(_ event: String, reason: String) {
         Self.logger.notice("LDAC controller \(event, privacy: .public); target=\(self.targetAddress ?? "none", privacy: .private(mask: .hash)) session=\(self.sessionID.uuidString, privacy: .public) reason=\(reason, privacy: .private)")
+    }
+
+    /// Logs a recovery decision with a public reason. Callers pass only clause names, counters and fixed
+    /// messages, never addresses, so the log can say which binding condition failed; the control status that
+    /// contains the source address stays private.
+    private func recordRecovery(_ event: String, reason: String) {
+        Self.logger.notice("LDAC controller \(event, privacy: .public); target=\(self.targetAddress ?? "none", privacy: .private(mask: .hash)) session=\(self.sessionID.uuidString, privacy: .public) reason=\(reason, privacy: .public) status=\(self.musicControlStatus, privacy: .private)")
     }
 
     private func completeStop() {

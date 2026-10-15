@@ -141,8 +141,8 @@ final class LDACNativeSession: @unchecked Sendable {
         let waitForReconnect: Bool
     }
 
-    private static let daemonEventExpression = try! NSRegularExpression(pattern: "connectedCB cid:0x|l2capDisconnected for CID: 0x|l2capDataInd for CID: 0x|ACL connected:|Received connection result for \"A2DP Source\" profile on device ", options: .caseInsensitive)
-    static let daemonPredicate = #"process == "bluetoothd" AND (eventMessage CONTAINS[c] "connectedCB cid:0x" OR eventMessage CONTAINS[c] "l2capDisconnected for CID: 0x" OR eventMessage CONTAINS[c] "l2capDataInd for CID: 0x" OR eventMessage CONTAINS[c] "ACL connected:" OR eventMessage CONTAINS[c] "Received connection result for \"A2DP Source\" profile on device ")"#
+    private static let daemonEventExpression = try! NSRegularExpression(pattern: "connectedCB cid:0x|l2capDisconnected for CID: 0x|l2capDataInd for CID: 0x|ACL connected:|ACL disconnected:|Received connection result for \"A2DP Source\" profile on device ", options: .caseInsensitive)
+    static let daemonPredicate = #"process == "bluetoothd" AND (eventMessage CONTAINS[c] "connectedCB cid:0x" OR eventMessage CONTAINS[c] "l2capDisconnected for CID: 0x" OR eventMessage CONTAINS[c] "l2capDataInd for CID: 0x" OR eventMessage CONTAINS[c] "ACL connected:" OR eventMessage CONTAINS[c] "ACL disconnected:" OR eventMessage CONTAINS[c] "Received connection result for \"A2DP Source\" profile on device ")"#
 
     let id: UUID
     private let address: String
@@ -187,6 +187,13 @@ final class LDACNativeSession: @unchecked Sendable {
     private var connected = false
     private var connectorReady = false
     private var connectorHandle: Int?
+    /// Whether `connectorHandle` can tell connections apart. IOBluetooth reports handle 0000 for every ACL on
+    /// current macOS, so the helper's `--expected-handle` comparison cannot reject a connection that is not ours.
+    private var connectorHandleGuarded = false
+    /// bluetoothd logged that the ACL created for this session ended, or that a newer one replaced it. bluetoothd
+    /// logs one `ACL connected:` and one `ACL disconnected:` line per connection, so either line after `FRESH_ACL`
+    /// means the current connection is not the one this session owns (L8).
+    private var ownedACLEnded = false
     private var originalConnectionEnded = false
     private var connectorStopSent = false
     private var connectorTerminationSent = false
@@ -477,6 +484,11 @@ final class LDACNativeSession: @unchecked Sendable {
                     deadline = DispatchTime.now() + 45
                 }
             }
+            if connected, !ownedACLEnded, children["restore-disconnect"] == nil,
+               LDACChannelGate.captures("ACL (?:dis)?connected: \(LDACChannelGate.addressPattern(address)),", line) != nil {
+                ownedACLEnded = true
+                record("OWNED_ACL_ENDED \(line)")
+            }
             if children["connector"] != nil && !connected &&
                 LDACChannelGate.captures("ACL connected: \(LDACChannelGate.addressPattern(address)), result (0)\\b", line) != nil {
                 connected = true
@@ -501,12 +513,14 @@ final class LDACNativeSession: @unchecked Sendable {
         } else if source == "connector" {
             if line.hasPrefix("CONNECT_READY") {
                 guard !connectorReady,
-                      let values = LDACChannelGate.captures("^CONNECT_READY handle=([0-9A-Fa-f]{4}) guarded=1$", line),
+                      let values = LDACChannelGate.captures("^CONNECT_READY handle=([0-9A-Fa-f]{4}) guarded=([01])$", line),
                       let handle = Int(values[0], radix: 16), handle != 0xFFFF else {
                     throw LDACSessionError("The paired Bluetooth audio connection reported invalid readiness.")
                 }
                 connectorReady = true
                 connectorHandle = handle
+                connectorHandleGuarded = values[1] == "1" && handle != 0
+                if !connectorHandleGuarded { record("CONNECT_IDENTITY handle=unusable owner=daemon-acl-events") }
             } else if connectorReady && (line == "CONNECT_RETIRED reason=original-connection-ended" ||
                 LDACChannelGate.captures("^CONNECTION_DISCONNECTED handle=([0-9A-Fa-f]{4}) connected=[01]$", line)?.first.flatMap({ Int($0, radix: 16) }) == connectorHandle) {
                 originalConnectionEnded = true
@@ -521,7 +535,7 @@ final class LDACNativeSession: @unchecked Sendable {
                let values = LDACChannelGate.captures("^AFTER callback=1 status=0x([0-9A-Fa-f]{8}) connected=0$", line),
                let status = UInt32(values[0], radix: 16), status != 0 {
                 connectorSettled = true
-                connectionLost("The headphones are still unavailable. LDAC will reconnect when they return.")
+                connectionLost("The headphones are still unavailable.")
             }
             if line.hasPrefix("CONNECT_CANCELLATION_UNCONFIRMED ") || line.hasPrefix("CONNECT_TERMINAL_UNCONFIRMED ") {
                 connectorSettlementUnverified = true
@@ -624,7 +638,7 @@ final class LDACNativeSession: @unchecked Sendable {
                       let applied = Double(values[0]), applied.isFinite, (0...1).contains(applied) {
                 emit(.gainApplied(applied))
             } else if line.hasPrefix("DRAIN_LIMIT "), active, !shouldStop {
-                connectionLost("The Bluetooth connection stalled. LDAC will reconnect.")
+                connectionLost("The Bluetooth connection stalled. Ordinary Bluetooth audio is being restored.")
             } else if line.hasPrefix("ENCODER_FAILED ") {
                 fail("Live LDAC transmission ended with an error.")
             } else if line.hasPrefix("FEED_COMPLETE ") {
@@ -641,7 +655,7 @@ final class LDACNativeSession: @unchecked Sendable {
                 waitingMediaTransportClosed = true
             } else if line.hasPrefix("PCM_FAILED ") {
                 if line.hasPrefix("PCM_FAILED reason=persistent-degradation ") {
-                    if !shouldStop { connectionLost(String(localized: "The Bluetooth connection couldn’t keep up. LDAC will reconnect.")) }
+                    if !shouldStop { connectionLost(String(localized: "The Bluetooth connection couldn’t keep up. Ordinary Bluetooth audio is being restored.")) }
                     else if !recoverableFailure { failForUser(String(localized: "LDAC stopped because the Bluetooth connection couldn’t keep up.")) }
                 } else {
                     fail(line)
@@ -1022,7 +1036,12 @@ final class LDACNativeSession: @unchecked Sendable {
         let recover = lock.withLock { recoveryRequested }
         if !recover && !restoreAudio && (priorityPhase == .unused || priorityPhase == .removed) { restoring = true; finish(); return }
         if children["disconnect"] == nil { restoring = true; finish(); return }
-        if !originalConnectionEnded {
+        if ownedACLEnded && !originalConnectionEnded && children["restore-disconnect"] == nil {
+            // The handle cannot identify connections, so this log evidence is the only ownership guard left:
+            // whatever connection exists now was made by someone else and must not be disconnected.
+            record("RESTORE_DISCONNECT_SKIPPED reason=owned-acl-ended handleGuarded=\(connectorHandleGuarded)")
+        }
+        if !originalConnectionEnded && !ownedACLEnded {
             if children["restore-disconnect"] == nil {
                 var arguments = ["--address", address, "--disconnect", "--restore"]
                 if let connectorHandle { arguments += ["--expected-handle", String(format: "%04X", connectorHandle)] }
@@ -1151,7 +1170,7 @@ final class LDACNativeSession: @unchecked Sendable {
             && (children["disconnect"] == nil || children["disconnect"]?.status == 0)
             && (children["restore-disconnect"] == nil || children["restore-disconnect"]?.status == 0 && restoreDisconnected)
             && !nativeAudioRestored
-            && (priorityRecoveryFailure == nil || originalConnectionEnded || restoreDisconnected)
+            && (priorityRecoveryFailure == nil || originalConnectionEnded || restoreDisconnected || ownedACLEnded)
         let nativeReplacement = recoverableFailure && nativeAudioRestored && lock.withLock { recoveryRequested }
         if nativeReplacement {
             message = "Ordinary Bluetooth audio replaced the LDAC connection. Retry LDAC to take over this output."
@@ -1173,7 +1192,7 @@ final class LDACNativeSession: @unchecked Sendable {
         }
         emit(.finished(Completion(message: publicMessage, canRetry: safe,
                                   requiresAttention: hardFailure || !recoverableFailure || !safe && !nativeAudioRestored || nativeReplacement,
-                                  targetDisconnected: (originalConnectionEnded || restoreDisconnected) && !nativeAudioRestored,
+                                  targetDisconnected: (originalConnectionEnded || restoreDisconnected || ownedACLEnded) && !nativeAudioRestored,
                                   waitForReconnect: (originalConnectionEnded || targetUnavailableBeforeRestore) && !nativeAudioRestored)))
     }
 
