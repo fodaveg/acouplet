@@ -194,6 +194,35 @@ final class SettingsStore: ObservableObject {
         #endif
     }
 
+    /// Runs the installer's `--unregister-login-item` or `--register-login-item` command and returns its exit
+    /// status, or returns nil for any other launch.
+    ///
+    /// `AcoupletMain` calls this before `NSApplication` exists, so these short-lived processes never register
+    /// with LaunchServices and a background service starting at the same time cannot take them for a running
+    /// copy of the app. Unregistering prints `login-item: removed` when a registration existed, which tells
+    /// the installer to give it back if the installation is rolled back.
+    static func runLoginItemCommand(_ arguments: [String], defaults: UserDefaults = .standard,
+                                    service: any LoginItemService = SMAppService.mainApp) -> Int32? {
+        guard arguments.count == 2, ["--unregister-login-item", "--register-login-item"].contains(arguments[1]) else {
+            return nil
+        }
+        defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
+        do {
+            if arguments[1] == "--register-login-item" {
+                try service.register()
+            } else if service.status == .enabled || service.status == .requiresApproval {
+                try service.unregister()
+                print("login-item: removed")
+            } else {
+                print("login-item: absent")
+            }
+            return EXIT_SUCCESS
+        } catch {
+            FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+            return EXIT_FAILURE
+        }
+    }
+
     func setLaunchAtLogin(_ enabled: Bool) {
         defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
         guard managesLaunchService else {
@@ -268,6 +297,15 @@ final class SettingsStore: ObservableObject {
         static let equalizerProfiles = "preferences.equalizerProfiles"
     }
 }
+
+/// The part of `SMAppService` that the installer's login-item commands use, so tests can replace it.
+protocol LoginItemService {
+    var status: SMAppService.Status { get }
+    func register() throws
+    func unregister() throws
+}
+
+extension SMAppService: LoginItemService {}
 
 #if !ACOUPLET_PUBLIC_APIS_ONLY
 enum LegacyBackgroundService {

@@ -11,6 +11,9 @@ enum AcoupletMain {
             return
         }
         #endif
+        if let status = SettingsStore.runLoginItemCommand(CommandLine.arguments) {
+            exit(status)
+        }
         AcoupletApp.main()
     }
 }

@@ -213,6 +213,7 @@ plist_written=false
 service_was_loaded=false
 service_should_start=true
 install_complete=false
+login_item_removed=false
 if [[ -e "$plist_path" ]]; then
     service_should_start=false
 elif [[ -e "$HOME/Library/LaunchAgents/$legacy_labels[1].plist" ]]; then
@@ -223,6 +224,11 @@ fi
 restore_installation() {
     if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
         /bin/launchctl bootout "$domain/$label" || return 1
+    fi
+    # The new app removed the login item before its service started; give it back while that app is
+    # still in place, because older builds cannot register it from the command line.
+    if [[ "$login_item_removed" == true ]] && ! "$installed_executable" --register-login-item >/dev/null; then
+        print -u2 "The previous login item could not be restored. Turn on Launch at login in Acouplet Settings if you used it."
     fi
     if [[ -d "$backup_app" ]]; then
         if [[ -e "$installed_app" ]]; then
@@ -421,6 +427,13 @@ if [[ ! -e "$plist_path" ]] ||
     /usr/bin/plutil -lint "$plist_path"
 fi
 if [[ "$service_should_start" == true ]]; then
+    # Remove the login item before the service starts. A copy of the app that is still running when
+    # the service checks for duplicates makes the service quit, and a clean exit is not relaunched.
+    if ! login_item_result="$("$installed_executable" --unregister-login-item)"; then
+        print -u2 "The previous login-item registration could not be removed."
+        exit 1
+    fi
+    if [[ "$login_item_result" == *"login-item: removed"* ]]; then login_item_removed=true; fi
     /bin/launchctl bootstrap "$domain" "$plist_path"
     for attempt in {1..20}; do
         service_state="$(/bin/launchctl print "$domain/$label")"
@@ -458,10 +471,6 @@ for index in {1..2}; do
     fi
     rm -f "$HOME/Library/LaunchAgents/$legacy_label.plist"
 done
-if [[ "$service_should_start" == true ]] && ! "$installed_executable" --unregister-login-item; then
-    print -u2 "Acouplet is installed, but its previous login-item registration could not be removed. Run the installer again to retry."
-    exit 1
-fi
 if ! /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$installed_app"; then
     print -u2 "Acouplet is installed, but its application registration could not be refreshed. Run the installer again to retry."
     exit 1

@@ -124,10 +124,14 @@ elif name == 'launchctl':
     else:
         raise AssertionError('Unexpected launchctl command: ' + str(args))
 elif name in ('Acouplet', 'XM5 Control'):
-    assert args == ['--unregister-login-item'], args
+    assert args == ['--unregister-login-item'] or name == 'Acouplet' and args == ['--register-login-item'], args
     if mode == 'helper-failure' and name == 'Acouplet': sys.exit(19)
     if mode == 'legacy-helper-failure' and name == 'XM5 Control': sys.exit(19)
-    if name == 'Acouplet': (root / 'login-item.json').write_text(json.dumps({'enabled': False}))
+    if name == 'Acouplet':
+        login_item = root / 'login-item.json'
+        enabled = json.loads(login_item.read_text())['enabled']
+        if args == ['--unregister-login-item']: print('login-item: ' + ('removed' if enabled else 'absent'))
+        login_item.write_text(json.dumps({'enabled': args == ['--register-login-item']}))
 elif name != 'sleep':
     raise AssertionError('Unexpected stub: ' + name)
 '''
@@ -282,7 +286,7 @@ for scenario in scenarios:
             assert len(recovery_plists) == 1, output
         else:
             assert not recovery_apps and not recovery_plists and not staged_apps, output
-            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure') or scenario in ('native-register-failure', 'helper-failure') else 'old'
+            expected = 'new' if successful or scenario in ('legacy-unregister-failure', 'legacy-helper-failure', 'native-register-failure') else 'old'
             assert (native / 'version').read_text() == expected, output
         if successful:
             assert json.loads((root / 'login-item.json').read_text())['enabled'] == (scenario == 'inactive-update'), output
@@ -298,13 +302,14 @@ for scenario in scenarios:
             assert not state[legacy_label]['loaded'] and not (agents / (legacy_label + '.plist')).exists(), state
         elif scenario in ('legacy-unregister-failure', 'legacy-helper-failure'):
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new' and legacy.exists(), state
-        elif scenario in ('native-register-failure', 'helper-failure'):
+        elif scenario == 'native-register-failure':
             assert state[native_label]['loaded'] and state[native_label]['version'] == 'new', state
             assert not state[legacy_label]['loaded'] and not legacy.exists(), state
-            assert ('application registration could not be refreshed' if scenario == 'native-register-failure'
-                    else 'previous login-item registration could not be removed') in output
-        elif scenario in ('bootstrap-failure', 'matching-plist-failure', 'installed-validation-failure'):
+            assert 'application registration could not be refreshed' in output
+        elif scenario in ('bootstrap-failure', 'matching-plist-failure', 'installed-validation-failure', 'helper-failure'):
             assert state == original_state and plist.read_bytes() == configs[native_label], state
+            if scenario == 'helper-failure':
+                assert 'previous login-item registration could not be removed' in output and legacy.exists(), output
         elif scenario not in ('restore-app-failure', 'restore-plist-failure', 'move-new-failure', 'restart-failure'):
             assert state == original_state and (plist.read_bytes() if plist.exists() else None) == before_plist, (scenario, state, original_state, output)
         if scenario in ('matching-plist', 'matching-plist-failure'):
@@ -314,10 +319,18 @@ for scenario in scenarios:
             assert ['lsregister', '-f', str(native)] in commands, commands
             assert (['Acouplet', '--unregister-login-item'] in commands) == (scenario != 'inactive-update'), commands
             assert commands.count(['XM5 Control', '--unregister-login-item']) == 2, commands
+            if scenario != 'inactive-update':
+                # The login item goes before the service starts, so no copy of the app is running when it checks for duplicates.
+                bootstrap_index = next(index for index, command in enumerate(commands)
+                                       if command[:2] == ['launchctl', 'bootstrap'] and command[3].endswith(native_label + '.plist'))
+                assert commands.index(['Acouplet', '--unregister-login-item']) < bootstrap_index, commands
+            assert ['Acouplet', '--register-login-item'] not in commands, commands
         if scenario in ('login-item-rollback', 'helper-failure'):
             assert json.loads((root / 'login-item.json').read_text())['enabled']
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
-            assert (['Acouplet', '--unregister-login-item'] in commands) == (scenario == 'helper-failure'), commands
+            assert ['Acouplet', '--unregister-login-item'] in commands, commands
+            # A failed start gives the login item back; a failed removal never took it away.
+            assert (['Acouplet', '--register-login-item'] in commands) == (scenario == 'login-item-rollback'), commands
         if scenario.startswith('native-quit-') or scenario == 'native-partial-quit':
             commands = [json.loads(line) for line in (root / 'commands.jsonl').read_text().splitlines()]
             assert ['osascript', '-', 'dev.baglayan.Acouplet'] in commands, commands
@@ -352,7 +365,7 @@ for scenario in scenarios:
             assert not controls.exists()
             assert unregistered == (scenario != 'fresh-install'), commands
             assert not reregistered, commands
-        if scenario in ('bootstrap-failure', 'matching-plist-failure', 'login-item-rollback'):
+        if scenario in ('bootstrap-failure', 'matching-plist-failure', 'login-item-rollback', 'helper-failure'):
             assert controls.exists() and unregistered and reregistered, commands
         if scenario in ('embedded-controls', 'foreign-controls'):
             assert not unregistered and not reregistered, commands

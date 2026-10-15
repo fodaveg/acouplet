@@ -69,14 +69,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        if CommandLine.arguments.contains("--unregister-login-item") {
-            environment.settings.setLaunchAtLogin(false)
-            if let error = environment.settings.launchAtLoginError {
-                print(error)
-                exit(EXIT_FAILURE)
-            }
-            exit(EXIT_SUCCESS)
-        }
         if !isRunningTests,
            let existing = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
             .first(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && $0.activationPolicy != .prohibited }) {

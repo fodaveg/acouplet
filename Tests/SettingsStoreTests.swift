@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 import XCTest
 @testable import Acouplet
 
@@ -280,6 +281,41 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testInstallerLoginItemCommandsRunOnlyForTheirArgumentsAndReportRemoval() throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let service = FakeLoginItemService(status: .enabled)
+
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet"], defaults: defaults, service: service))
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet", "--background-service"], defaults: defaults, service: service))
+        XCTAssertNil(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item", "--background-service"],
+                                                       defaults: defaults, service: service))
+        XCTAssertNil(defaults.object(forKey: "preferences.launchAtLoginDefaultApplied"))
+        XCTAssertEqual(service.calls, [])
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister"])
+        XCTAssertEqual(service.status, .notRegistered)
+        XCTAssertTrue(defaults.bool(forKey: "preferences.launchAtLoginDefaultApplied"))
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister"], "An absent login item is not unregistered again")
+
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--register-login-item"], defaults: defaults, service: service), EXIT_SUCCESS)
+        XCTAssertEqual(service.calls, ["unregister", "register"])
+        XCTAssertEqual(service.status, .enabled)
+
+        let approval = FakeLoginItemService(status: .requiresApproval)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: approval), EXIT_SUCCESS)
+        XCTAssertEqual(approval.calls, ["unregister"])
+
+        let failing = FakeLoginItemService(status: .enabled, fails: true)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--unregister-login-item"], defaults: defaults, service: failing), EXIT_FAILURE)
+        XCTAssertEqual(SettingsStore.runLoginItemCommand(["Acouplet", "--register-login-item"], defaults: defaults, service: failing), EXIT_FAILURE)
+    }
+
+    @MainActor
     func testGlobalShortcutConflictRecoversAfterRegistrationIsReleased() throws {
         let first = GlobalHotKeyController {}
         let second = GlobalHotKeyController {}
@@ -490,5 +526,28 @@ final class SettingsStoreTests: XCTestCase {
         let restored = SettingsStore(defaults: defaults)
         XCTAssertEqual(restored.customEqualizerDraft, settings.customEqualizerDraft)
         XCTAssertEqual(restored.equalizerProfiles, [profile])
+    }
+}
+
+private final class FakeLoginItemService: LoginItemService {
+    private(set) var status: SMAppService.Status
+    private(set) var calls: [String] = []
+    private let fails: Bool
+
+    init(status: SMAppService.Status, fails: Bool = false) {
+        self.status = status
+        self.fails = fails
+    }
+
+    func register() throws {
+        guard !fails else { throw CocoaError(.featureUnsupported) }
+        calls.append("register")
+        status = .enabled
+    }
+
+    func unregister() throws {
+        guard !fails else { throw CocoaError(.featureUnsupported) }
+        calls.append("unregister")
+        status = .notRegistered
     }
 }
