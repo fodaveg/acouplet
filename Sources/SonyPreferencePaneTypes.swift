@@ -182,6 +182,21 @@ enum SonyPreferencePaneWire {
         return "anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"\(team)\""
     }
 
+    /// Where the app listens for the device panes (G11). The sandboxed App Store build keeps the socket in its
+    /// container's `tmp`; the direct build has no container and uses `~/Library/Application Support/Acouplet`,
+    /// so nothing is created in the home folder. The panes try both, container first, so one pane works with
+    /// either distribution. `home` is the user's real home folder, not the container's.
+    static func socketPath(sandboxed: Bool, home: String = userHome) -> String {
+        sandboxed
+            ? home + "/Library/Containers/dev.baglayan.Acouplet/Data/tmp/" + socketName
+            : home + "/Library/Application Support/Acouplet/" + socketName
+    }
+
+    /// The user's home folder from the user database, which stays the real one inside a sandbox.
+    static var userHome: String {
+        getpwuid(getuid()).map { String(cString: $0.pointee.pw_dir) } ?? NSHomeDirectory()
+    }
+
     static func failure(_ message: String) -> NSError {
         NSError(domain: "SonyPreferencePane", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }

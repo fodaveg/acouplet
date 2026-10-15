@@ -17,8 +17,28 @@ final class SonyPreferencePaneClient: ObservableObject {
     private var appliedSequence = 0
     private var commandError: String?
     private var commandFailure: (request: SonyPreferencePaneRequest, reported: Bool)?
-    private let path = FileManager.default.homeDirectoryForCurrentUser.path
-        + "/Library/Containers/dev.baglayan.Acouplet/Data/tmp/" + SonyPreferencePaneWire.socketName
+    private let paths = SonyPreferencePaneClient.socketPaths()
+
+    /// The app's sockets in the order the pane tries them: the App Store build's container, then the direct
+    /// build's Application Support folder (G11).
+    nonisolated static func socketPaths(home: String = SonyPreferencePaneWire.userHome) -> [String] {
+        [SonyPreferencePaneWire.socketPath(sandboxed: true, home: home),
+         SonyPreferencePaneWire.socketPath(sandboxed: false, home: home)]
+    }
+
+    /// Connects to the first socket that accepts, so a missing or stale socket of the other distribution is
+    /// skipped. Throws the first socket's error when none accepts.
+    nonisolated static func connect(paths: [String]) throws -> Int32 {
+        var firstError: (any Error)?
+        for path in paths {
+            do {
+                return try SonyPreferencePaneWire.connect(path: path)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        throw firstError ?? SonyPreferencePaneWire.failure("Open Acouplet to use these settings.")
+    }
 
     init(pinnedAddress: String? = nil, appTeam: String? = nil) {
         self.pinnedAddress = pinnedAddress
@@ -161,13 +181,13 @@ final class SonyPreferencePaneClient: ObservableObject {
     }
 
     private func exchange(_ request: SonyPreferencePaneRequest, generation: UUID) async {
-        let path = path
+        let paths = paths
         let appRequirement = appRequirement
         requestSequence += 1
         let sequence = requestSequence
         do {
             let reply = try await Task.detached {
-                let fd = try SonyPreferencePaneWire.connect(path: path)
+                let fd = try SonyPreferencePaneClient.connect(paths: paths)
                 defer { close(fd) }
                 try SonyPreferencePaneWire.authenticate(fd, requirement: appRequirement)
                 try SonyPreferencePaneWire.send(request, to: fd)

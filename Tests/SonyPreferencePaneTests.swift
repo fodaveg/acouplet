@@ -4,6 +4,42 @@ import XCTest
 @MainActor
 @available(macOS 27.0, *)
 final class SonyPreferencePaneTests: XCTestCase {
+    /// A socket of the test's own, so the tests never touch the installed app's socket.
+    private let socketPath = FileManager.default.temporaryDirectory.path + "/pane-\(UUID().uuidString.prefix(8)).sock"
+
+    func testSocketPathFollowsTheDistribution() {
+        XCTAssertEqual(SonyPreferencePaneWire.socketPath(sandboxed: true, home: "/Users/someone"),
+                       "/Users/someone/Library/Containers/dev.baglayan.Acouplet/Data/tmp/sony-pane.sock")
+        XCTAssertEqual(SonyPreferencePaneWire.socketPath(sandboxed: false, home: "/Users/someone"),
+                       "/Users/someone/Library/Application Support/Acouplet/sony-pane.sock")
+        XCTAssertFalse(SonyPreferencePaneWire.userHome.contains("/Library/Containers/"),
+                       "The paths start from the real home folder, also inside a sandbox")
+    }
+
+    func testServerCreatesItsFolderPrivateAndRefusesAPathTooLongForASocket() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "pane-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let devices = SonyDeviceCoordinator(controller: SonyHeadphonesController(startAutomatically: false, simulated: true))
+
+        let folder = root.appending(path: "Acouplet")
+        let server = SonyPreferencePaneServer(devices: devices, path: folder.path + "/sony-pane.sock")
+        try server.start()
+        let attributes = try FileManager.default.attributesOfItem(atPath: folder.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        let fd = try SonyPreferencePaneWire.connect(path: folder.path + "/sony-pane.sock")
+        close(fd)
+        server.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path + "/sony-pane.sock"))
+
+        // sun_path holds 104 bytes with the terminating NUL.
+        let long = root.appending(path: String(repeating: "x", count: 110))
+        let tooLong = SonyPreferencePaneServer(devices: devices, path: long.path + "/sony-pane.sock")
+        XCTAssertThrowsError(try tooLong.start()) { error in
+            XCTAssertEqual(error.localizedDescription, "The local connection path is too long.")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: long.path), "Nothing is created for a path that cannot work")
+    }
+
     func testAppRequirementUsesThePaneTeamAndKeepsTheOriginalTeamOtherwise() {
         let original = "anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"5743Y47SC7\""
         XCTAssertEqual(SonyPreferencePaneWire.appRequirement(team: nil), original)
@@ -18,7 +54,7 @@ final class SonyPreferencePaneTests: XCTestCase {
     func testCommandsRejectStaleSessionServerAndDuplicateWithoutWriting() async throws {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         controller.simulateDeviceConnection(named: "WF-1000XM5")
-        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true)
+        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true, path: socketPath)
         try server.start()
         defer { server.stop() }
         let initial = await server.reply(to: .init(version: SonyPreferencePaneWire.version, id: UUID(), action: .snapshot))
@@ -50,7 +86,7 @@ final class SonyPreferencePaneTests: XCTestCase {
     func testUnverifiedHostIntegrationRemainsReadOnlyAndStoppedServerRejects() async throws {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         controller.simulateDeviceConnection(named: "WF-1000XM5")
-        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller))
+        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), path: socketPath)
         try server.start()
         defer { server.stop() }
         let initial = await server.reply(to: .init(version: SonyPreferencePaneWire.version, id: UUID(), action: .snapshot))
@@ -72,7 +108,7 @@ final class SonyPreferencePaneTests: XCTestCase {
         for model in [SonyDeviceModel.wfXM5, .wfXM6, .whXM3, .whCH720N] {
             let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
             controller.simulateGalleryDevice(model: model)
-            let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller))
+            let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), path: socketPath)
             try server.start()
             let reply = await server.reply(to: .init(version: SonyPreferencePaneWire.version, id: UUID(), action: .snapshot))
             server.stop()
@@ -103,7 +139,7 @@ final class SonyPreferencePaneTests: XCTestCase {
             SonyConnectedDevice(address: second.address, name: second.deviceName, model: .wfXM5)!,
         ])
         coordinator.select(address: first.address)
-        let server = SonyPreferencePaneServer(devices: coordinator, allowsCommands: true)
+        let server = SonyPreferencePaneServer(devices: coordinator, allowsCommands: true, path: socketPath)
         try server.start()
         defer { server.stop(); first.simulateControlLoss(); second.simulateControlLoss() }
         var request = try await self.request(.systemFeature, server: server, address: second.address)
@@ -128,7 +164,7 @@ final class SonyPreferencePaneTests: XCTestCase {
     func testSettingTimeoutAndSessionLossNeverReportApplied() async throws {
         for disconnect in [false, true] {
             let controller = makeController()
-            let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true)
+            let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true, path: socketPath)
             try server.start()
             var request = try await self.request(.dsee, server: server, address: controller.address)
             request.option = "0"
@@ -154,7 +190,7 @@ final class SonyPreferencePaneTests: XCTestCase {
 
     func testInvalidCurveUnsupportedChoiceAndChangedSourceCannotWrite() async throws {
         let controller = makeController()
-        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true)
+        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true, path: socketPath)
         try server.start()
         defer { server.stop() }
         let baseline = controller.simulatedTransmittedFrames
@@ -182,7 +218,7 @@ final class SonyPreferencePaneTests: XCTestCase {
 
     func testCompleteEqualizerCurveNeedsConfirmedMatchingLayoutAndValues() async throws {
         let controller = makeController()
-        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true)
+        let server = SonyPreferencePaneServer(devices: SonyDeviceCoordinator(controller: controller), allowsCommands: true, path: socketPath)
         try server.start()
         defer { server.stop(); controller.simulateControlLoss() }
         let snapshot = await server.reply(to: .init(version: SonyPreferencePaneWire.version, id: UUID(), action: .snapshot))

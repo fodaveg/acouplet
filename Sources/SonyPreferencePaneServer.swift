@@ -10,16 +10,23 @@ final class SonyPreferencePaneServer {
     private var listener: DispatchSourceRead?
     private var clients: [UUID: (fd: Int32, task: Task<Void, Never>)] = [:]
     private var recentCommands: [UUID] = []
-    private let path = NSHomeDirectory() + "/tmp/" + SonyPreferencePaneWire.socketName
+    private let path: String
     private nonisolated static let logger = Logger(subsystem: "dev.baglayan.Acouplet", category: "PreferencePane")
 
-    init(devices: SonyDeviceCoordinator, allowsCommands: Bool = false) {
+    /// `path` defaults to the socket of this distribution: the container in the sandbox, Application Support
+    /// outside it.
+    init(devices: SonyDeviceCoordinator, allowsCommands: Bool = false,
+         path: String = SonyPreferencePaneWire.socketPath(
+            sandboxed: ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil)) {
         self.devices = devices
         self.allowsCommands = allowsCommands
+        self.path = path
     }
 
+    /// Starts listening. Throws, before creating anything, when the path does not fit in `sun_path`.
     func start() throws {
         guard listener == nil else { return }
+        var address = try SonyPreferencePaneWire.address(path)
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -40,7 +47,6 @@ final class SonyPreferencePaneServer {
         } else if errno != ENOENT {
             throw SonyPreferencePaneWire.failure("The local settings connection path could not be checked.")
         }
-        var address = try SonyPreferencePaneWire.address(path)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SonyPreferencePaneWire.failure("The local settings connection could not be created.") }
         do {

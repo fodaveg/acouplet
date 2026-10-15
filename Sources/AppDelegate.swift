@@ -375,16 +375,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Starts the local connection that the device preference panes read (decision D10).
     ///
-    /// The server listens in this process's `~/tmp`, which is where the panes look only when the app runs in
-    /// its sandbox container. Outside the sandbox it starts only if device panes are installed, so it does
-    /// not create `~/tmp` in the home folder for nothing.
+    /// The socket is in the sandbox container in the App Store build and in Application Support in the direct
+    /// one (`SonyPreferencePaneWire.socketPath`), and the panes look in both, so it starts in every build. A
+    /// path too long for a socket is logged and leaves the server stopped.
     private func startPreferencePaneServer() {
-        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
-        let panes = getpwuid(getuid()).map { URL(fileURLWithPath: String(cString: $0.pointee.pw_dir))
-            .appending(path: "Library/PreferencePanes") }
-        let hasDevicePanes = panes.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) }?
-            .contains { $0.hasPrefix("Sony-") && $0.hasSuffix(".prefPane") } == true
-        guard sandboxed || hasDevicePanes else { return }
         let server = SonyPreferencePaneServer(devices: environment.devices)
         do {
             try server.start()
