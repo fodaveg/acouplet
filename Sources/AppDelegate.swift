@@ -233,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        environment.ldac.refreshDriverState()
+        environment.ldac.refreshDriverStateInBackground()
         #endif
     }
 

@@ -266,7 +266,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
 
     func popoverWillShow(_ notification: Notification) {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        ldac.refreshDriverState()
+        ldac.refreshDriverStateInBackground()
         #endif
         retriedControllers.removeAll()
         let shownAt = ProcessInfo.processInfo.systemUptime

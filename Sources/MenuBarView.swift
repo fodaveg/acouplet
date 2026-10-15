@@ -748,7 +748,7 @@ struct LDACDriverGuidance: View {
         .foregroundStyle(.primary)
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityIdentifier("audio.driverGuidance")
-        .onAppear { ldac.refreshDriverState() }
+        .onAppear { ldac.refreshDriverStateInBackground() }
     }
 }
 
