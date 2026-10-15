@@ -183,5 +183,17 @@ enum LDACSessionDiagnosticsCheck {
         precondition(contents(url) == "fourth\n")
         let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
         precondition(names == ["session.log", "session.log.1"], "\(names)")
+
+        // A handle without a known file still records, and only skips the rotation.
+        let unnamed = directory.appendingPathComponent("unnamed.log")
+        precondition(FileManager.default.createFile(atPath: unnamed.path, contents: nil))
+        var handle: FileHandle? = try FileHandle(forWritingTo: unnamed)
+        defer { try? handle?.close() }
+        var written = 0
+        for line in ["first\n", "more\n", "third\n"] {
+            written = LDACNativeSession.appendSessionLog(Data(line.utf8), to: &handle, at: nil, loggedBytes: written, limit: 12)
+        }
+        precondition(contents(unnamed) == "first\nmore\nthird\n" && written == 17, "A log without a known file stopped recording")
+        precondition(!FileManager.default.fileExists(atPath: unnamed.path + ".1"))
     }
 }

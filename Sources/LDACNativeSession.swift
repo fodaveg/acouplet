@@ -1291,7 +1291,6 @@ final class LDACNativeSession: @unchecked Sendable {
     }
 
     private func record(_ line: String) {
-        guard let logURL else { return }
         loggedBytes = Self.appendSessionLog(Data("\(Date().timeIntervalSince1970) \(line)\n".utf8), to: &log, at: logURL,
                                             loggedBytes: loggedBytes)
     }
@@ -1300,12 +1299,13 @@ final class LDACNativeSession: @unchecked Sendable {
     ///
     /// When the log would pass `limit`, it becomes `session.log.1`, replacing an older one, and a new log starts,
     /// so a session keeps its first lines and stays under twice the limit. Emptying the log in place lost the
-    /// first 175 s of a session. If the new log cannot be opened, the session stops logging.
-    static func appendSessionLog(_ data: Data, to log: inout FileHandle?, at url: URL, loggedBytes: Int,
+    /// first 175 s of a session. If the new log cannot be opened, the session stops logging. A handle whose
+    /// file is unknown (`url` nil) is still written to, but cannot rotate.
+    static func appendSessionLog(_ data: Data, to log: inout FileHandle?, at url: URL?, loggedBytes: Int,
                                  limit: Int = 8 * 1024 * 1024) -> Int {
         guard let current = log else { return loggedBytes }
         var loggedBytes = loggedBytes
-        if loggedBytes > 0, loggedBytes + data.count > limit {
+        if let url, loggedBytes > 0, loggedBytes + data.count > limit {
             guard rename(url.path, url.path + ".1") == 0 else { return loggedBytes }
             try? current.close()
             log = nil
