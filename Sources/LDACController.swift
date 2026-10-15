@@ -21,7 +21,6 @@ final class LDACController: ObservableObject {
     @Published private(set) var multipointShutdownAddress: String?
     private var multipointConflictConfiguration: LDACConfiguration?
     private var multipointShutdownTask: Task<Void, Never>?
-    private var didAttemptAutomaticDriverUpdate = false
     private let bundle: Bundle
     private let defaults: UserDefaults?
     @Published private var pendingConnectionModes: [String: UUID] = [:] {
@@ -169,15 +168,16 @@ final class LDACController: ObservableObject {
         openDriverInstaller()
     }
 
-    func updateInstalledDriverIfNeeded() {
-        guard !didAttemptAutomaticDriverUpdate, !isSessionRunning, !isOpeningDriverInstaller else { return }
+    /// Opens the bundled driver update in Installer.app. Only the panel's Update LDAC Driver button calls it:
+    /// the app never opens an installer by itself (decision D13).
+    func updateDriver() {
+        guard !isSessionRunning, !isOpeningDriverInstaller else { return }
         refreshDriverState()
         guard driverState == .outdated else { return }
         openDriverInstaller()
     }
 
     private func openDriverInstaller() {
-        didAttemptAutomaticDriverUpdate = true
         driverInstallationError = nil
         isOpeningDriverInstaller = true
         Task {

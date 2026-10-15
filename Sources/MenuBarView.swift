@@ -80,6 +80,25 @@ struct MenuBarView: View {
                 .scrollBounceBehavior(.basedOnSize)
                 .accessibilityIdentifier("headphones.controlsScroll")
             }
+            #if !ACOUPLET_PUBLIC_APIS_ONLY
+            if needsLDACDriverUpdate, !showsLDACControl {
+                Divider()
+                Button {
+                    dismissMenu()
+                    ldac.updateDriver()
+                } label: {
+                    Label("Update LDAC Driver…", systemImage: "arrow.down.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderless)
+                .tint(nil)
+                .disabled(ldac.isOpeningDriverInstaller)
+                .help("This version of Acouplet includes a newer LDAC audio driver.")
+                .accessibilityIdentifier("menu.updateLDACDriver")
+            }
+            #endif
             #if ACOUPLET_SPARKLE
             if updater.hasPendingUpdate {
                 Divider()
@@ -188,8 +207,7 @@ struct MenuBarView: View {
                 .disabled(controlsDisabled)
             }
             #if !ACOUPLET_PUBLIC_APIS_ONLY
-            if showsLDACSession || (settings.experimentalLDACEnabled && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
-                || (ldac.targetAddress == headphones.address && ldac.state != .off))) {
+            if showsLDACControl {
                 ldacControl
             }
             #endif
@@ -229,6 +247,16 @@ struct MenuBarView: View {
     }
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
+    private var showsLDACControl: Bool {
+        showsLDACSession || (settings.experimentalLDACEnabled && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
+            || (ldac.targetAddress == headphones.address && ldac.state != .off)))
+    }
+
+    /// The LDAC controls offer the update themselves; otherwise the panel shows its own row (decision D13).
+    private var needsLDACDriverUpdate: Bool {
+        settings.experimentalLDACEnabled && ldac.driverState == .outdated && !ldac.isSessionRunning
+    }
+
     private var ldacState: LDACState { ldac.targetAddress == headphones.address ? ldac.state : .off }
     private var isTurningOffMultipointForLDAC: Bool { ldac.multipointShutdownAddress == headphones.address }
 

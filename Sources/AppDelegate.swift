@@ -193,12 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
         #if !ACOUPLET_PUBLIC_APIS_ONLY
         environment.notifications.start()
-        environment.settings.$experimentalLDACEnabled
-            .removeDuplicates()
-            .sink { [weak self] enabled in
-                if enabled { self?.environment.ldac.updateInstalledDriverIfNeeded() }
-            }
-            .store(in: &cancellables)
+        // A newer bundled LDAC driver is offered in the panel (Update LDAC Driver); Installer.app opens only from there.
         #endif
         let workspaceNotifications = NSWorkspace.shared.notificationCenter
         workspaceNotifications.publisher(for: NSWorkspace.willPowerOffNotification)

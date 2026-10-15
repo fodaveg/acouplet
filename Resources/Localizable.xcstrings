@@ -16823,6 +16823,40 @@
           }
         }
       }
+    },
+    "Update LDAC Driver…": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update LDAC Driver…"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LDAC Sürücüsünü Güncelle…"
+          }
+        }
+      }
+    },
+    "This version of Acouplet includes a newer LDAC audio driver.": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This version of Acouplet includes a newer LDAC audio driver."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acouplet’in bu sürümü daha yeni bir LDAC ses sürücüsü içeriyor."
+          }
+        }
+      }
     }
   },
   "version": "1.1"
