@@ -401,6 +401,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         if multipointTransition?.isFinished == false { return "multipoint" }
         return nil
     }
+    /// The device that the latest source switch requested in Acouplet selects, unless that switch failed. Tells a
+    /// switch the user asked for apart from another multipoint device taking over playback by itself.
+    var requestedSourceSwitchAddress: String? {
+        guard let transition = sourceTransition, transition.requestedKeeping == nil, transition.phase != .failed else { return nil }
+        return transition.targetAddress
+    }
     /// True when a connection-mode change is leaving Sound Quality, or has left it, which LDAC requires.
     var isLeavingLDACConnectionMode: Bool {
         guard supportsConnectionMode else { return false }

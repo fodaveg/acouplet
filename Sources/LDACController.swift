@@ -1058,8 +1058,16 @@ final class LDACController: ObservableObject {
         session?.recoverConnection(reason: message)
     }
 
-    /// A real change of source or connection mode ends LDAC with a notice; stopping restores ordinary audio (D5).
+    /// A source switch requested in Acouplet, or a connection-mode change, ends LDAC with a notice; stopping restores
+    /// ordinary audio (D5). Any other move of the selected source is another multipoint device playing, which is
+    /// usually brief (a phone notification): LDAC suspends with ordinary audio and resumes once the Mac is the source.
     private func stopForChange(_ reason: String) {
+        if reason != "connection-mode", let selected = headphones?.multipoint.selectedSource?.address,
+           headphones?.requestedSourceSwitchAddress != selected {
+            recordRecovery("source-suspended", reason: reason)
+            suspend(restoreAudio: true, reason: "another headphone music source is active")
+            return
+        }
         recordRecovery("source-changed", reason: reason)
         fail(reason == "connection-mode"
              ? String(localized: "The headphones left Sound Quality mode. LDAC stopped and ordinary Bluetooth audio was restored.")

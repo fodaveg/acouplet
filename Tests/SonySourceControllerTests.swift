@@ -99,6 +99,7 @@ final class SonySourceControllerTests: XCTestCase {
         XCTAssertEqual(controller.sourceTransition?.phase, .awaitingKeeping)
         deliver([0x39, 0x01, 0, 0], to: controller)
         XCTAssertEqual(controller.sourceTransition?.phase, .complete)
+        XCTAssertNil(controller.requestedSourceSwitchAddress, "Keeping was taken for a requested source switch")
         controller.selectAudioSource(phone)
         XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x38, 0x01, 1])
         XCTAssertNotNil(controller.connectionModeUnavailableReason(.stableConnection))
@@ -120,6 +121,8 @@ final class SonySourceControllerTests: XCTestCase {
         deliver(inventory(command: 0x37, selected: 2), to: controller)
         XCTAssertEqual(controller.sourceTransition?.phase, .complete)
         XCTAssertEqual(controller.multipoint.selectedSource?.address, phone.address)
+        XCTAssertEqual(controller.requestedSourceSwitchAddress, controller.multipoint.selectedSource?.address,
+                       "LDAC could not tell a requested switch from another source taking over")
         XCTAssertFalse(controller.simulatedInventoryReadPending)
         XCTAssertEqual(changes.map(\.name), ["Phone"])
         controller.simulateControlLoss()

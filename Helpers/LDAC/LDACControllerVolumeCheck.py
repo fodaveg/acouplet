@@ -95,6 +95,7 @@ final class SonyHeadphonesController: ObservableObject {
     var ldacRequiresMultipointOff = false
     var pendingControlTransition: String?
     var isLeavingLDACConnectionMode = false
+    var requestedSourceSwitchAddress: String?
     var supportsConnectionMode = true
     @Published var connectionMode: SonyConnectionMode? = .soundQuality
     @Published var connectionTransition: ConnectionTransition?
@@ -600,7 +601,10 @@ enum Check {
             changed.controlsChanged()
             precondition(changed.usable && changed.requestedAddress != nil)
             changedDevice.pendingControlTransition = nil
-            if change == "source" { changedDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:03") }
+            if change == "source" {
+                changedDevice.requestedSourceSwitchAddress = "02:00:00:00:00:03"
+                changedDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:03")
+            }
             else { changedDevice.isLeavingLDACConnectionMode = true }
             changed.controlsChanged()
             precondition(changed.requestedAddress == nil && changedRaw.audioRestorations == [true] && !changed.isRecovering,
@@ -777,20 +781,27 @@ enum Check {
         try await waitUntil { !forced.isSessionRunning }
         precondition(forced.session == nil && forced.state == .off)
 
-        let (otherSource, sourceDevice, _, sourceRaw) = try await started(.v2)
-        sourceDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:03")
-        sourceDevice.localSource = false
-        otherSource.controlsChanged()
-        precondition(otherSource.requestedAddress == nil && sourceRaw.stops == 1, "Phone playback did not stop LDAC")
-        precondition(sourceRaw.audioRestorations == [true], "Phone playback left ordinary Mac Bluetooth audio disconnected")
-        sourceRaw.emit(.finished(.init(message: nil)))
-        try await waitUntil { !otherSource.isSessionRunning }
-        precondition(otherSource.state != .waitingForDevice && otherSource.state != .off, "Phone playback stopped LDAC silently")
-        sourceDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:02")
-        sourceDevice.localSource = true
-        for _ in 0..<10 { otherSource.resumeIfReady() }
-        precondition(otherSource.session == nil, "LDAC took the headphones back after another source played")
-        print("PASS actual completion routing: manual Off never reconnects absent headphones; another multipoint source stops LDAC with ordinary audio restored and a notice (D5)")
+        for controlsFresh in [true, false] {
+            let (otherSource, sourceDevice, _, sourceRaw) = try await active(source: "02:00:00:00:00:02")
+            sourceDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:03")
+            sourceDevice.localSource = false
+            if !controlsFresh { sourceDevice.volumeFresh = false }
+            otherSource.controlsChanged()
+            precondition(otherSource.requestedAddress == sourceDevice.address && sourceRaw.stops == 1,
+                         "Another multipoint source playing stopped LDAC instead of suspending it")
+            precondition(sourceRaw.audioRestorations == [true], "Phone playback left ordinary Mac Bluetooth audio disconnected")
+            sourceRaw.emit(.finished(.init(message: nil)))
+            try await waitUntil { otherSource.state == .waitingForDevice }
+            for _ in 0..<10 { otherSource.resumeIfReady() }
+            precondition(otherSource.session == nil, "LDAC took over another multipoint source")
+            sourceDevice.multipoint.selectedSource = .init(address: "02:00:00:00:00:02")
+            sourceDevice.localSource = true
+            sourceDevice.volumeFresh = true
+            otherSource.resumeIfReady()
+            try await waitUntil { otherSource.session != nil }
+            try await stop(otherSource)
+        }
+        print("PASS actual completion routing: manual Off never reconnects absent headphones; another multipoint source playing suspends LDAC with ordinary audio and resumes once the Mac is the source again")
         print("PASS scope: production controller methods and volume mapping; fake transport, confirmations, observations and native output; no hardware or installation")
     }
 }
@@ -835,7 +846,12 @@ with tempfile.TemporaryDirectory(prefix="acouplet-ldac-controller-volume-") as d
              "let output = self.nativeOutput {", "A Mac-side volume change configured the Mac output it came from"),
             ("late configure tolerance", "                        catch is LDACOwnerTimeoutError {",
              "                        catch let error as LDACOwnerTimeoutError where false {", "A late owner reply to configure stopped LDAC"),
-            ("binding hold","            holdBinding(reason, transition: transition)\n            return",
+            ("multipoint suspension", "           headphones?.requestedSourceSwitchAddress != selected {",
+             "           headphones?.requestedSourceSwitchAddress != selected, false {",
+             "Another multipoint source playing stopped LDAC instead of suspending it"),
+            ("requested-switch stop", "           headphones?.requestedSourceSwitchAddress != selected {",
+             "           true {", "A real source change did not stop LDAC and restore ordinary audio"),
+            ("binding hold", "            holdBinding(reason, transition: transition)\n            return",
              "            recoverBinding(reason)\n            return", "A transient loss of volume freshness tore LDAC down"),
             ("source-change stop", "        case let .sourceChanged(reason):\n            stopForChange(reason)\n            return",
              "        case let .sourceChanged(reason):\n            recoverBinding(reason)\n            return",
