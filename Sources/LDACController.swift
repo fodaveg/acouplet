@@ -7,7 +7,7 @@ import OSLog
 
 @MainActor
 final class LDACController: ObservableObject {
-    @Published private(set) var state: LDACState = .off
+    @Published private(set) var state: LDACState = .off { didSet { syncStreamingFlag() } }
     @Published private(set) var targetAddress: String?
     @Published private(set) var isSessionRunning = false
     @Published private(set) var isRecovering = false
@@ -35,7 +35,17 @@ final class LDACController: ObservableObject {
     private var requestedConfiguration = LDACConfiguration()
     private var nativeOutput: LDACOwnerOutput?
     private var outputID: UUID?
-    private var headphones: SonyHeadphonesController?
+    private var headphones: SonyHeadphonesController? {
+        didSet {
+            if oldValue !== headphones { oldValue?.isLDACStreaming = false }
+            syncStreamingFlag()
+        }
+    }
+
+    /// EXPERIMENTAL: tells the Sony controller to skip periodic settings reads while LDAC streams.
+    private func syncStreamingFlag() {
+        if case .active = state { headphones?.isLDACStreaming = true } else { headphones?.isLDACStreaming = false }
+    }
     private var controlObservation: AnyCancellable?
     private var availabilityObservations = Set<AnyCancellable>()
     private let audioRoute: MacAudioRouteObserver?

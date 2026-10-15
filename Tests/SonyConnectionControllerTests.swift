@@ -1657,6 +1657,21 @@ final class SonyConnectionControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testPeriodicSettingsPollIsSkippedWhileLDACStreams() throws {
+        let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
+        controller.simulateDeviceConnection(named: "WF-1000XM5")
+        var count = 0
+        while controller.simulatedPendingFrame != nil, count < 80 { acknowledge(controller); count += 1 }
+        XCTAssertNil(controller.simulatedPendingFrame)
+        controller.isLDACStreaming = true
+        for _ in 0..<10 { controller.simulateAutomaticRefresh() }
+        XCTAssertNil(controller.simulatedPendingFrame)
+        controller.isLDACStreaming = false
+        for _ in 0..<5 { controller.simulateAutomaticRefresh() }
+        XCTAssertNotNil(controller.simulatedPendingFrame)
+    }
+
+    @MainActor
     func testOldReadbackCannotConfirmAfterAlertReplyAndUnknownAlertsDoNotPause() throws {
         let controller = SonyHeadphonesController(startAutomatically: false, simulated: true)
         controller.simulateDeviceConnection(named: "WF-1000XM5")

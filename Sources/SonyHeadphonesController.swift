@@ -859,6 +859,8 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var deviceActionRecoveryAttempts = 0
     private var nextRetryDate: Date?
     private var syncPollCount = 0
+    /// EXPERIMENTAL: set by LDACController while LDAC is streaming to these headphones.
+    var isLDACStreaming = false
     private var supportsTable2 = false
     private var supportFunctionsReadTransmitted = false
     @Published private var discoveryReads: [[UInt8]: DiscoveryRead] = [:]
@@ -1815,7 +1817,11 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         syncPollCount += 1
         if syncPollCount >= 5 {
             syncPollCount = 0
-            requestCurrentSettings()
+            if isLDACStreaming {
+                Self.logger.info("settings poll skipped: LDAC streaming")
+            } else {
+                requestCurrentSettings()
+            }
         }
     }
 
