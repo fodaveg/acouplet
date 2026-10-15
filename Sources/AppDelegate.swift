@@ -10,7 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var retriesBackgroundServiceMigration = false
     private var isSystemTerminating = false
 
-    private static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
+    /// Asks the running copy whose process ID is the notification's object to open Settings.
+    static let reopenNotification = Notification.Name("dev.baglayan.Acouplet.reopen")
     private var globalHotKeyController: GlobalHotKeyController?
     private var menuBarController: MenuBarController?
     private var cancellables = Set<AnyCancellable>()

@@ -671,7 +671,8 @@ struct MenuBarView: View {
                 Button("About Acouplet", action: showAbout)
                 .accessibilityIdentifier("menu.about")
                 Divider()
-                if settings.hasBackgroundService {
+                // Quitting concerns this process: only the LaunchAgent's copy sends you to Login Items instead.
+                if settings.isBackgroundServiceProcess {
                     Button("Background Service…") { SMAppService.openSystemSettingsLoginItems() }
                 } else {
                     Button("Quit Acouplet") { NSApp.terminate(nil) }

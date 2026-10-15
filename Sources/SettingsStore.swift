@@ -67,7 +67,13 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var backgroundServiceStatus: SMAppService.Status = .notRegistered
     @Published var backgroundServiceMigrationError: String?
     var retryBackgroundServiceMigration: (() -> Void)?
+    /// Whether the app is installed with its LaunchAgent, read from the plist's real state rather than from
+    /// how this copy was started (decision D9). Settings then shows the service instead of Launch at login.
     var hasBackgroundService: Bool {
+        backgroundServiceStatus == .enabled || backgroundServiceStatus == .requiresApproval
+    }
+    /// Whether this process is the LaunchAgent's copy, which launchd starts with `--background-service`.
+    var isBackgroundServiceProcess: Bool {
         CommandLine.arguments.contains("--background-service")
     }
     @Published var globalShortcutEnabled: Bool {
@@ -196,7 +202,8 @@ final class SettingsStore: ObservableObject {
 
     func enableLaunchAtLoginByDefault() {
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        guard !hasBackgroundService, !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
+        guard !hasBackgroundService, !isBackgroundServiceProcess,
+              !defaults.bool(forKey: Keys.launchAtLoginDefaultApplied) else { return }
         defaults.set(true, forKey: Keys.launchAtLoginDefaultApplied)
         if !managesLaunchService || SMAppService.mainApp.status == .notRegistered {
             setLaunchAtLogin(true)
@@ -478,17 +485,17 @@ enum LegacyBackgroundService {
         try launchctl(["bootstrap", domain, plistURL.path])
     }
 
-    private static func launchctl(_ arguments: [String]) throws {
-        try command("/bin/launchctl", arguments)
+    static func launchctl(_ arguments: [String], quiet: Bool = false) throws {
+        try command("/bin/launchctl", arguments, quiet: quiet)
     }
 
-    private static func command(_ executable: String, _ arguments: [String]) throws {
+    private static func command(_ executable: String, _ arguments: [String], quiet: Bool = false) throws {
         let process = Process()
         let completion = DispatchSemaphore(value: 0)
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.standardError
+        process.standardError = quiet ? FileHandle.nullDevice : FileHandle.standardError
         process.terminationHandler = { _ in completion.signal() }
         try process.run()
         if completion.wait(timeout: .now() + 5) == .timedOut {
