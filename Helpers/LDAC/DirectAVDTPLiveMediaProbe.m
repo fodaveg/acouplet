@@ -5,10 +5,15 @@
 #include "LDACParentLifetime.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <sys/event.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <pthread/qos.h>
 #include <poll.h>
 #include <stdlib.h>
@@ -75,6 +80,98 @@ static void RecordSenderStage(SenderTiming *timing, int stage) {
 static SenderTiming NewSenderTiming(void) {
     return (SenderTiming){.wallAt = MonotonicTime(),
         .cpuAt = (double)clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) / 1000000000.0};
+}
+
+// Scheduler counters for the breach diagnostics (audit L3, decision D3). The sender takes one
+// sample per drained packet, about 1 µs for the two system calls, and prints the change on each
+// breach. macOS does not split voluntary from involuntary switches: getrusage leaves ru_nvcsw at 0
+// and counts every switch in ru_nivcsw (measured on macOS 27, 15 Oct 2026). What separates a
+// thread that waited for a CPU from one that slept past its deadline is the time it spent runnable
+// without running, runnable minus CPU. Both counters cover the whole helper process, whose other
+// threads only deliver Bluetooth callbacks, and the kernel adds to them in steps of about 10 ms, so
+// windows shorter than that can show a small negative wait.
+typedef struct {
+    BOOL available;
+    double wall;
+    uint64_t runnable;
+    uint64_t cpu;
+    uint64_t performanceCPU;
+    uint64_t interruptWakeups;
+    long contextSwitches;
+} SchedulerSample;
+
+static double MachSeconds(uint64_t ticks) {
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    return (double)ticks * timebase.numer / timebase.denom / 1000000000.0;
+}
+
+static SchedulerSample TakeSchedulerSample(void) {
+    SchedulerSample sample = {.wall = MonotonicTime()};
+    struct rusage_info_v6 usage;
+    struct rusage switches;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&usage) != 0 ||
+        getrusage(RUSAGE_SELF, &switches) != 0) return sample;
+    sample.available = YES;
+    sample.runnable = usage.ri_runnable_time;
+    sample.cpu = usage.ri_user_time + usage.ri_system_time;
+    sample.performanceCPU = usage.ri_user_ptime + usage.ri_system_ptime;
+    sample.interruptWakeups = usage.ri_interrupt_wkups;
+    sample.contextSwitches = switches.ru_nvcsw + switches.ru_nivcsw;
+    return sample;
+}
+
+static const char *QoSName(qos_class_t qos) {
+    switch (qos) {
+        case QOS_CLASS_USER_INTERACTIVE: return "user-interactive";
+        case QOS_CLASS_USER_INITIATED: return "user-initiated";
+        case QOS_CLASS_DEFAULT: return "default";
+        case QOS_CLASS_UTILITY: return "utility";
+        case QOS_CLASS_BACKGROUND: return "background";
+        case QOS_CLASS_UNSPECIFIED: return "unspecified";
+        default: return "other";
+    }
+}
+
+static const char *PolicyName(int policy) {
+    switch (policy) {
+        case POLICY_TIMESHARE: return "timeshare";
+        case POLICY_RR: return "round-robin";
+        case POLICY_FIFO: return "fifo";
+        default: return "unknown";
+    }
+}
+
+// Prints `SCHED_SAMPLE trigger=<line key> …` with the change since `since` and the calling
+// thread's scheduling state now. `packet` is negative when the trigger has no packet number.
+static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSample since) {
+    SchedulerSample now = TakeSchedulerSample();
+    thread_t thread = pthread_mach_thread_np(pthread_self());
+    thread_extended_info_data_t state = {0};
+    mach_msg_type_number_t stateCount = THREAD_EXTENDED_INFO_COUNT;
+    BOOL stateRead = thread_info(thread, THREAD_EXTENDED_INFO, (thread_info_t)&state, &stateCount) == KERN_SUCCESS;
+    thread_time_constraint_policy_data_t constraint;
+    mach_msg_type_number_t constraintCount = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t constraintDefault = TRUE;
+    int realtime = thread_policy_get(thread, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&constraint,
+        &constraintCount, &constraintDefault) == KERN_SUCCESS ? !constraintDefault : -1;
+    qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+    int relativePriority = 0;
+    if (pthread_get_qos_class_np(pthread_self(), &qos, &relativePriority) != 0) qos = QOS_CLASS_UNSPECIFIED;
+    BOOL counted = since.available && now.available;
+    char packetField[32] = "";
+    if (packet >= 0) snprintf(packetField, sizeof(packetField), " packet=%ld", packet);
+    printf("SCHED_SAMPLE trigger=%s%s window=%.6f countersAvailable=%d runnable=%.6f cpu=%.6f waitingForCPU=%.6f performanceCPU=%.6f contextSwitches=%ld voluntarySplit=unavailable interruptWakeups=%llu qos=%s qosRelative=%d policy=%s priority=%d basePriority=%d maxPriority=%d realtime=%d threadCPUUsage=%d runState=%d\n",
+           trigger, packetField, now.wall - since.wall, counted,
+           counted ? MachSeconds(now.runnable - since.runnable) : -1,
+           counted ? MachSeconds(now.cpu - since.cpu) : -1,
+           counted ? MachSeconds(now.runnable - since.runnable) - MachSeconds(now.cpu - since.cpu) : -1,
+           counted ? MachSeconds(now.performanceCPU - since.performanceCPU) : -1,
+           counted ? now.contextSwitches - since.contextSwitches : -1,
+           counted ? now.interruptWakeups - since.interruptWakeups : 0,
+           QoSName(qos), relativePriority, stateRead ? PolicyName(state.pth_policy) : "unread",
+           stateRead ? state.pth_curpri : -1, stateRead ? state.pth_priority : -1, stateRead ? state.pth_maxpriority : -1,
+           realtime, stateRead ? state.pth_cpu_usage : -1, stateRead ? state.pth_run_state : -1);
 }
 
 static BOOL ReadOption(int fd, int option, int *value) {
@@ -500,6 +597,11 @@ static BOOL SelfTest(void) {
         ParseDurationSeconds(@"60", &seconds) == ACOUPLET_LDAC_PROBE_ONLY;
     passed &= ParseGain(@"0", &gain) && gain == 0 && !ParseGain(@"nan", &gain) && !ParseGain(@"1.01", &gain);
     passed &= [NormalizeAddress("02:00:00:00:00:ab") isEqualToString:@"02-00-00-00-00-AB"] && !NormalizeAddress("02-00-00-00-00-G6");
+    SchedulerSample before = TakeSchedulerSample();
+    usleep(2000);
+    SchedulerSample after = TakeSchedulerSample();
+    passed &= before.available && after.available && after.wall > before.wall && after.runnable >= before.runnable &&
+        after.cpu >= before.cpu && after.contextSwitches > before.contextSwitches;
     return MatrixChecks() && passed;
 }
 
@@ -529,6 +631,7 @@ static BOOL SelfTest(void) {
 @property HANDLE_LDAC_BT encoder;
 @property int encoderMTU;
 @property DegradationState degradation;
+@property SchedulerSample schedulerBaseline;
 @property BOOL stdinEnded;
 @property BOOL stopRequested;
 @property BOOL closeRequested;
@@ -567,6 +670,7 @@ static BOOL SelfTest(void) {
     self.pcmDiscardedBytes += bytes;
     printf("PCM_SKIP frames=%lu totalSkippedFrames=%llu bufferedFrames=%lu\n",
            bytes / 8, self.pcmSkippedBytes / 8, self.pcmBytes / 8);
+    PrintSchedulerSample("PCM_SKIP", -1, self.schedulerBaseline);
     if (!ResetEncoder(self.encoder, self.encoderMTU, self.profile)) {
         printf("PCM_FAILED reason=encoder-reset code=%d\n", ldacBT_get_error_code(self.encoder));
         self.failed = YES;
@@ -672,6 +776,7 @@ static BOOL ContinuousPCMChecks(void) {
     if (!probe.encoder || ldacBT_init_handle_encode(probe.encoder, probe.encoderMTU, profile.eqmid,
             LDACBT_CHANNEL_MODE_STEREO, LDACBT_SMPL_FMT_F32, profile.sampleRate) != 0) return NO;
     probe.degradation = (DegradationState){.windowEnd = MonotonicTime() + 1};
+    probe.schedulerBaseline = TakeSchedulerSample();
     probe.pcmReserveBytes = profile.prefillBytes;
     probe.pcmHead = profile.capacityBytes - PCMBlockBytes;
     probe.pcmBytes = profile.prefillBytes + PCMBlockBytes * 3 + 7;
@@ -970,6 +1075,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         printf("LIVE_BEGIN gain=%.17g seconds=%u targetSamples=%llu bufferedFrames=%lu reserveFrames=%lu\n",
                gain, seconds, targetSamples, probe.pcmBytes / 8, probe.pcmReserveBytes / 8);
         SenderTiming timing = NewSenderTiming();
+        probe.schedulerBaseline = TakeSchedulerSample();
+        PrintSchedulerSample("LIVE_BEGIN", -1, probe.schedulerBaseline);
         while (YES) {
             RecordSenderStage(&timing, SenderControl);
             PollLiveControls(probe);
@@ -1030,6 +1137,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                                sourceSamples, now - due, first, lastPollAt - started, pollAt - lastPollAt, now - pollAt,
                                lastPollCount, lastPollFlags, lastPollData, count, count > 0 ? event.flags : 0,
                                count > 0 ? (long)event.data : 0, pollError);
+                        PrintSchedulerSample("PCM_BREACH", (long)sentPackets, probe.schedulerBaseline);
                         lastPollAt = now;
                         lastPollCount = count;
                         lastPollFlags = count > 0 ? event.flags : 0;
@@ -1140,6 +1248,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                        timing.wall[SenderPCM], timing.cpu[SenderPCM], timing.wall[SenderEncode], timing.cpu[SenderEncode],
                        timing.wall[SenderPacing], timing.cpu[SenderPacing], timing.maximumPacing,
                        timing.wall[SenderOther], timing.cpu[SenderOther]);
+                PrintSchedulerSample("PACING_BREACH", (long)sentPackets, probe.schedulerBaseline);
                 lastPollAt = now;
                 lastPollCount = count;
                 lastPollFlags = count > 0 ? event.flags : 0;
@@ -1191,6 +1300,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                            sentPackets - 1, now - started, drainDuration, first, lastPollAt - started, pollAt - lastPollAt,
                            now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
                            count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError);
+                    PrintSchedulerSample("DRAIN_BREACH", (long)sentPackets - 1, probe.schedulerBaseline);
                 }
                 lastPollAt = now;
                 lastPollCount = count;
@@ -1223,6 +1333,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             }
             if (drained) {
                 timing = NewSenderTiming();
+                probe.schedulerBaseline = TakeSchedulerSample();
                 drainedPackets++;
                 drainedSamples = sentSamples;
                 if (drainedPackets == 1) printf("LIVE_SENT packets=1 rate=%u channels=2 bitrateKbps=%d eqmid=%d\n",
