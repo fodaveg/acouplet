@@ -151,6 +151,21 @@ final class SonyNotificationServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testLowBatteryPolicyIsOnlyPersistedWhenItChanges() async throws {
+        let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let devices = SonyDeviceCoordinator(controller: SonyHeadphonesController(startAutomatically: false, displayOnly: true))
+        let notifications = SonyNotificationService(settings: SettingsStore(defaults: defaults), devices: devices)
+        let key = "notifications.lowBatteryHistory"
+        let healthy = SonyLowBatteryPolicy.Reading(part: .headphones, level: 80, isCharging: false, observedAt: Date())
+        XCTAssertNil(defaults.data(forKey: key))
+        await notifications.updateLowBattery(deviceID: "WH", name: "WH-1000XM5", readings: [healthy])
+        await notifications.updateLowBattery(deviceID: "WH", name: "WH-1000XM5", readings: [healthy])
+        XCTAssertNil(defaults.data(forKey: key), "An unchanged policy must not be written to UserDefaults")
+    }
+
+    @MainActor
     func testOptInFailureAndPersistenceOnlyConsumePresentedWarnings() async throws {
         let suiteName = "dev.baglayan.Acouplet.tests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

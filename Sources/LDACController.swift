@@ -29,7 +29,10 @@ final class LDACController: ObservableObject {
     @Published private var pendingConnectionModes: [String: UUID] = [:] {
         didSet { defaults?.set(pendingConnectionModes.mapValues(\.uuidString), forKey: "ldac.pendingConnectionPreferences") }
     }
-    private let inspectDriver: (Bundle) -> LDACDriverInstaller.State
+    /// Inspector inyectado (tests). Sin él se usa `LDACDriverInstaller`, con la validación de firmas fuera del hilo principal.
+    private let inspectDriver: ((Bundle) -> LDACDriverInstaller.State)?
+    private let isDriverInspectionEnabled: () -> Bool
+    private var driverInspectionTask: Task<Void, Never>?
     private let isClassicConnected: (String) -> Bool
     private var session: LDACOwnerSession?
     private var sessionID = UUID()
@@ -91,13 +94,15 @@ final class LDACController: ObservableObject {
     private nonisolated static let logger = Logger(subsystem: "dev.baglayan.Acouplet", category: "LDACLifecycle")
 
     init(bundle: Bundle = .main, devices: SonyDeviceCoordinator? = nil, audioRoute: MacAudioRouteObserver? = nil, defaults: UserDefaults? = nil,
-         inspectDriver: @escaping (Bundle) -> LDACDriverInstaller.State = { LDACDriverInstaller.inspect(bundle: $0) },
+         inspectDriver: ((Bundle) -> LDACDriverInstaller.State)? = nil,
+         isDriverInspectionEnabled: @escaping () -> Bool = { true },
          isClassicConnected: @escaping (String) -> Bool = { IOBluetoothDevice(addressString: $0)?.isClassicConnected() == true }) {
         self.bundle = bundle
         self.defaults = defaults
         self.inspectDriver = inspectDriver
+        self.isDriverInspectionEnabled = isDriverInspectionEnabled
         self.isClassicConnected = isClassicConnected
-        driverState = inspectDriver(bundle)
+        driverState = inspectDriver?(bundle) ?? .unavailable("")
         helpers = LDACNativeSession.Helpers(bundle: bundle)
         self.devices = devices
         self.audioRoute = audioRoute
@@ -116,8 +121,9 @@ final class LDACController: ObservableObject {
             .sink { [weak self] notification in
                 guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                       application.bundleIdentifier == "com.apple.installer" else { return }
-                self?.refreshDriverState()
+                self?.refreshDriverStateInBackground()
             }.store(in: &availabilityObservations)
+        if inspectDriver == nil { refreshDriverStateInBackground() }
     }
 
     var needsStopBeforeTermination: Bool { isSessionRunning || !preferenceRestoreTasks.isEmpty }
@@ -175,7 +181,32 @@ final class LDACController: ObservableObject {
         }
     }
 
+    /// Inspección síncrona, para los flujos que deciden justo antes de arrancar o instalar. Usa la caché del instalador.
     func refreshDriverState() {
+        guard !isSessionRunning else { return }
+        let state = inspectDriver?(bundle) ?? LDACDriverInstaller.inspect(bundle: bundle)
+        if driverState != state { driverState = state }
+    }
+
+    /// Inspección para la interfaz (arranque, activación de la app, apertura del panel): no bloquea el hilo principal,
+    /// no hace nada con LDAC desactivado y se fusiona con otra que ya esté en curso.
+    func refreshDriverStateInBackground() {
+        guard isDriverInspectionEnabled(), !isSessionRunning else { return }
+        guard inspectDriver == nil else { refreshDriverState(); return }
+        guard driverInspectionTask == nil else { return }
+        driverInspectionTask = Task {
+            await refreshDriverStateAsync()
+            driverInspectionTask = nil
+        }
+    }
+
+    private func refreshDriverStateAsync() async {
+        guard let inspectDriver else {
+            let state = await LDACDriverInstaller.inspectInBackground(bundle: bundle)
+            guard !isSessionRunning else { return }
+            if driverState != state { driverState = state }
+            return
+        }
         guard !isSessionRunning else { return }
         let state = inspectDriver(bundle)
         if driverState != state { driverState = state }
@@ -183,6 +214,7 @@ final class LDACController: ObservableObject {
 
     func installDriver(forAddress address: String) {
         guard deviceUnavailableReason(forAddress: address) == nil, !isSessionRunning, !isOpeningDriverInstaller else { return }
+        LDACDriverInstaller.invalidateCache()
         refreshDriverState()
         guard driverState == .missing || driverState == .outdated else { return }
         openDriverInstaller()
@@ -190,9 +222,12 @@ final class LDACController: ObservableObject {
 
     func updateInstalledDriverIfNeeded() {
         guard !didAttemptAutomaticDriverUpdate, !isSessionRunning, !isOpeningDriverInstaller else { return }
-        refreshDriverState()
-        guard driverState == .outdated else { return }
-        openDriverInstaller()
+        Task {
+            await refreshDriverStateAsync()
+            guard !didAttemptAutomaticDriverUpdate, !isSessionRunning, !isOpeningDriverInstaller,
+                  driverState == .outdated else { return }
+            openDriverInstaller()
+        }
     }
 
     private func openDriverInstaller() {

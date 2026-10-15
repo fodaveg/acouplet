@@ -32,7 +32,8 @@ final class AppEnvironment {
         self.devices = devices
         self.audioRoute = audioRoute
         #if !ACOUPLET_PUBLIC_APIS_ONLY
-        ldac = LDACController(devices: devices, audioRoute: audioRoute, defaults: settings.defaults)
+        ldac = LDACController(devices: devices, audioRoute: audioRoute, defaults: settings.defaults,
+                              isDriverInspectionEnabled: { [unowned settings] in settings.experimentalLDACEnabled })
         notifications = SonyNotificationService(settings: settings, devices: devices,
                                                 presentLowBattery: { [weak devices, noiseModeHUD] warning, _ in
             guard let headphones = devices?.controller(for: warning.deviceID) else { return false }

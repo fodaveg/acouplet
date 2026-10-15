@@ -1,6 +1,7 @@
 import Combine
 import CoreBluetooth
 import Foundation
+@preconcurrency import IOBluetooth
 
 struct SonyConnectedDevice: Identifiable, Equatable {
     let address: String
@@ -76,6 +77,11 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
 
     var discoveryTimer: Timer?
     var bluetoothAuthorizationManager: CBCentralManager?
+    /// Última autorización de Bluetooth conocida. `CBManager.authorization` es una IPC síncrona a TCC, así que se
+    /// consulta al arrancar, al despertar y en `centralManagerDidUpdateState`, no en cada sondeo del inventario.
+    var cachedBluetoothAuthorization: CBManagerAuthorization = .notDetermined
+    var connectNotification: IOBluetoothUserNotification?
+    var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
     var discoveryGeneration: UInt64 = 0
     @Published var isDiscovering = false
     @Published var isSystemSleeping = false
@@ -144,6 +150,7 @@ final class SonyDeviceCoordinator: NSObject, ObservableObject {
             isDiscovering = false
             discoveryTimer?.invalidate()
             discoveryTimer = nil
+            stopInventoryNotifications()
             for controller in controllers {
                 controller.stop()
                 controller.reportBluetoothAuthorization(authorization)

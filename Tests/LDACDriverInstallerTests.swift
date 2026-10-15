@@ -68,6 +68,23 @@ final class LDACDriverInstallerTests: XCTestCase {
         XCTAssertEqual(changes, 3)
     }
 
+    func testBackgroundRefreshOnlyInspectsWhenLDACIsEnabled() {
+        var enabled = false
+        var inspections = 0
+        let controller = LDACController(inspectDriver: { _ in
+            inspections += 1
+            return .current
+        }, isDriverInspectionEnabled: { enabled })
+        XCTAssertEqual(inspections, 1)
+
+        controller.refreshDriverStateInBackground()
+        XCTAssertEqual(inspections, 1)
+
+        enabled = true
+        controller.refreshDriverStateInBackground()
+        XCTAssertEqual(inspections, 2)
+    }
+
     func testRefreshAfterCancelledInstallationStillRequiresUpdate() {
         let controller = LDACController(inspectDriver: { _ in
             LDACDriverInstaller.state(required: 3, installed: 2, loaded: 2)
