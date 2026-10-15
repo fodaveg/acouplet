@@ -786,7 +786,7 @@ final class LDACController: ObservableObject {
     }
 
     private var bindingIsCurrent: Bool {
-        guard hasOwnedMusicContext, let headphones else { return false }
+        guard let headphones, hasOwnedMusicContext || headphones.isChangingSourceKeepingOnly else { return false }
         return headphones.notificationSession == controlSession
             && headphones.multipoint.selectedSource?.address == sourceAddress
             && headphones.playback.musicVolumeRange == volumeRange

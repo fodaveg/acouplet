@@ -126,6 +126,27 @@ final class SonySourceControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testEnablingKeepingKeepsTheFieldsLDACBindingDependsOn() throws {
+        let controller = preparedController()
+        deliver(inventory(command: 0x39, selected: 1), to: controller)
+        let source = controller.multipoint.selectedSource?.address
+        let session = controller.notificationSession
+        let range = controller.playback.musicVolumeRange
+        XCTAssertNotNil(source)
+        controller.setSourceKeeping(true)
+        acknowledgeAll(controller)
+        deliver([0x37, 0x01, 0], to: controller)
+        XCTAssertTrue(controller.isChangingSourceKeepingOnly)
+        deliver([0x39, 0x01, 0, 0], to: controller)
+        XCTAssertFalse(controller.isChangingSourceKeepingOnly)
+        XCTAssertEqual(controller.sourceTransition?.phase, .complete)
+        XCTAssertEqual(controller.multipoint.selectedSource?.address, source)
+        XCTAssertEqual(controller.notificationSession, session)
+        XCTAssertEqual(controller.playback.musicVolumeRange, range)
+        controller.simulateControlLoss()
+    }
+
+    @MainActor
     func testEarlierInventoryReadCannotBecomeSwitchConfirmation() throws {
         let controller = preparedController()
         let phone = try XCTUnwrap(controller.multipoint.devices.last)

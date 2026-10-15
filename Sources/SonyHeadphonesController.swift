@@ -391,6 +391,12 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             && [playback.statusQueryPayload, playback.musicVolumeQueryPayload]
                 .allSatisfy { playbackReads[$0] == nil && !queuedPlaybackQueries.contains($0) }
     }
+    /// EXPERIMENTAL: true while only the "keep current audio source" flag is being written. It leaves the
+    /// selected source untouched, but any unfinished source transition makes `hasCurrentMusicVolumeControl` false.
+    var isChangingSourceKeepingOnly: Bool {
+        guard let transition = sourceTransition else { return false }
+        return transition.requestedKeeping != nil && !transition.isFinished
+    }
     func hasCurrentMusicSourceContext(for localAddress: @autoclosure () -> String?) -> Bool {
         guard hasCurrentTable2Capabilities else { return false }
         guard multipoint.supportsInventory else { return true }
