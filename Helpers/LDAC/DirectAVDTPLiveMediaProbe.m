@@ -174,6 +174,23 @@ static void PrintSchedulerSample(const char *trigger, long packet, SchedulerSamp
            realtime, stateRead ? state.pth_cpu_usage : -1, stateRead ? state.pth_run_state : -1);
 }
 
+// Audit L9: drain and pacing accept any writable space of at least the baseline, so a send buffer
+// that bluetoothd enlarges no longer ends the stream. The first change is logged once.
+typedef struct {
+    long baseline;
+    BOOL reported;
+} SocketBufferState;
+
+static BOOL SocketDrained(intptr_t writable, int baseline) {
+    return writable >= baseline;
+}
+
+static void NoteSocketBuffer(SocketBufferState *state, intptr_t writable, NSUInteger packet) {
+    if (state->reported || writable == state->baseline) return;
+    state->reported = YES;
+    printf("SOCKET_BUFFER_CHANGED packet=%lu baseline=%ld writable=%ld\n", packet, state->baseline, (long)writable);
+}
+
 static BOOL ReadOption(int fd, int option, int *value) {
     socklen_t length = sizeof(*value);
     return getsockopt(fd, SOL_SOCKET, option, value, &length) == 0;
@@ -631,6 +648,7 @@ static BOOL SelfTest(void) {
         ParseDurationSeconds(@"60", &seconds) == ACOUPLET_LDAC_PROBE_ONLY;
     passed &= ParseGain(@"0", &gain) && gain == 0 && !ParseGain(@"nan", &gain) && !ParseGain(@"1.01", &gain);
     passed &= [NormalizeAddress("02:00:00:00:00:ab") isEqualToString:@"02-00-00-00-00-AB"] && !NormalizeAddress("02-00-00-00-00-G6");
+    passed &= SocketDrained(8192, 8192) && SocketDrained(16384, 8192) && !SocketDrained(8191, 8192) && !SocketDrained(0, 8192);
     SchedulerSample before = TakeSchedulerSample();
     usleep(2000);
     SchedulerSample after = TakeSchedulerSample();
@@ -1121,6 +1139,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             event.flags & (EV_ERROR | EV_EOF) || event.data <= 0 || event.data > INT_MAX) break;
         double initialPollAt = MonotonicTime();
         int baseline = (int)event.data;
+        SocketBufferState socketBuffer = {.baseline = baseline};
         if (setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &baseline, sizeof(baseline)) != 0) break;
         lowWaterChanged = YES;
         printf("SOCKET fd=%d CID=%04X outgoingMTU=%u type=%d baseline=%d\n",
@@ -1203,7 +1222,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                         lastPollFlags = count > 0 ? event.flags : 0;
                         lastPollData = count > 0 ? (long)event.data : 0;
                         lastLatenessAt = now;
-                        if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || event.data != baseline))) {
+                        if (count > 0) NoteSocketBuffer(&socketBuffer, event.data, sentPackets);
+                        if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || !SocketDrained(event.data, baseline)))) {
                             probe.failed = YES;
                             break;
                         }
@@ -1314,7 +1334,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 lastPollFlags = count > 0 ? event.flags : 0;
                 lastPollData = count > 0 ? (long)event.data : 0;
                 lateness = now - due;
-                if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || event.data != baseline))) break;
+                if (count > 0) NoteSocketBuffer(&socketBuffer, event.data, sentPackets);
+                if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || !SocketDrained(event.data, baseline)))) break;
             }
             lastLatenessAt = now;
             if (!probe.pcmSkippedBytes && RecordRecovery(&recovery, now, lateness))
@@ -1375,7 +1396,8 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f\n",
                            sentPackets - 1, (long)event.data, baseline, now - started, drainDuration, event.flags,
                            wakeGap);
-                    if (event.data == baseline) drained = YES;
+                    NoteSocketBuffer(&socketBuffer, event.data, sentPackets - 1);
+                    if (SocketDrained(event.data, baseline)) drained = YES;
                 }
                 double drainLimit = continuous ? (double)profile.capacityBytes / (profile.sampleRate * 8) : 0.25;
                 if (drainDuration >= drainLimit || now >= deadline) {
