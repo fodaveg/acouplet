@@ -157,6 +157,8 @@ struct MigrationCheck {
             precondition(migrated["EnvironmentVariables"] as? [String: String] ==
                          [LegacyBackgroundService.policyKey: LegacyBackgroundService.policy, "EXISTING_SETTING": "retained"])
             precondition(migrated["StandardErrorPath"] as? String == "/tmp/acouplet-fixture.log")
+            // Without a ProcessType launchd clamps the service and its LDAC helpers to the utility QoS.
+            precondition(migrated["ProcessType"] as? String == "Interactive")
         }
         let invalid: [String: Any] = ["Label": LegacyBackgroundService.label,
                                      "ProgramArguments": [LegacyBackgroundService.executablePath, "--background-service"],

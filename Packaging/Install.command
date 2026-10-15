@@ -391,6 +391,9 @@ new_app_installed=true
 /usr/bin/codesign --verify --deep --strict --test-requirement="=anchor apple generic and identifier \"dev.baglayan.Acouplet\" and certificate leaf[subject.OU] = \"$app_team\"" "$installed_app"
 
 mkdir -p "${plist_path:h}"
+# ProcessType Interactive: without it launchd starts the service as a daemon-type job and clamps the
+# whole process tree, LDAC helpers included, to the utility QoS (priority 20). An existing plist
+# without it differs from this one, so an update rewrites it and restarts the service.
 plist_content="$(cat <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -409,6 +412,8 @@ plist_content="$(cat <<'PLIST'
     </array>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>RunAtLoad</key>
     <true/>
     <key>EnvironmentVariables</key>
