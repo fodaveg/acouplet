@@ -237,7 +237,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
         wantsPopover = true
         if openRequestedAt == nil {
             openRequestedAt = ProcessInfo.processInfo.systemUptime
-            Self.logger.info("Panel open requested")
+            Self.logger.notice("Panel open requested")
         }
         preparePopoverContent()
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -309,7 +309,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     func popoverDidShow(_ notification: Notification) {
         if let requestedAt = openRequestedAt {
             let milliseconds = Int((ProcessInfo.processInfo.systemUptime - requestedAt) * 1000)
-            Self.logger.info("Panel shown \(milliseconds, privacy: .public) ms after the open request")
+            Self.logger.notice("Panel shown \(milliseconds, privacy: .public) ms after the open request")
             openRequestedAt = nil
         }
         retryVisibleControls()
