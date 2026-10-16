@@ -1401,6 +1401,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         double deadline = continuous ? INFINITY : started + seconds + 1;
         double nextProgress = started + 1;
         double lastPollAt = initialPollAt;
+        double maximumDrainSinceProgress = 0; // Longest send-to-drain wait since the last LIVE_PROGRESS line (L7).
         int lastPollCount = 1;
         unsigned int lastPollFlags = event.flags;
         long lastPollData = (long)event.data;
@@ -1653,6 +1654,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 now = MonotonicTime();
                 lastDrainObservation = now;
                 double drainDuration = now - afterSend;
+                maximumDrainSinceProgress = fmax(maximumDrainSinceProgress, drainDuration);
                 if (drainDuration >= 0.1 && !drainBreached) {
                     drainBreached = YES;
                     BOOL first = RecordBreach(&recovery, now);
@@ -1712,10 +1714,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     probe.gainAckReady = NO;
                 }
                 if (now >= nextProgress) {
-                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f\n",
+                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f maxDrain=%.4f\n",
                            sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
                            lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
-                           sentRTPSamples, sourceResync);
+                           sentRTPSamples, sourceResync, maximumDrainSinceProgress);
+                    maximumDrainSinceProgress = 0;
                     nextProgress = now + 1;
                     FlushBreachStreaks(breachStreaks, now, NO);
                 }
