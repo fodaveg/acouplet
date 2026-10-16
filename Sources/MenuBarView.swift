@@ -72,14 +72,15 @@ struct MenuBarView: View {
                     .padding(.top, 20)
                     .padding(.bottom, 16)
             }
-            ViewThatFits(in: .vertical) {
+            // One ScrollView instead of ViewThatFits, which built and measured every control twice (G9).
+            // The panel size still comes from the ideal height of the VStack below: `.fixedSize(vertical:)` asks
+            // the ScrollView for its content height, and `.frame(maxHeight:)` clamps it to the screen. It does not
+            // depend on the height the popover currently has, so there is no feedback loop with the measurement.
+            ScrollView {
                 controls
-                ScrollView {
-                    controls
-                }
-                .scrollBounceBehavior(.basedOnSize)
-                .accessibilityIdentifier("headphones.controlsScroll")
             }
+            .scrollBounceBehavior(.basedOnSize)
+            .accessibilityIdentifier("headphones.controlsScroll")
             ForEach(devicesNeedingConfirmation, id: \.address) { controller in
                 Divider()
                 Button {

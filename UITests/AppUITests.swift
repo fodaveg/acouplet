@@ -1520,7 +1520,6 @@ final class AppUITests: XCTestCase {
             let panel = app.popovers.containing(.group, identifier: "headphones.dashboard").firstMatch
             XCTAssertTrue(dashboard.waitForExistence(timeout: 3))
             XCTAssertTrue(app.images["device.artwork.case"].exists)
-            XCTAssertFalse(app.scrollViews["headphones.controlsScroll"].exists)
             XCTAssertTrue(app.buttons["menu.settings"].isHittable)
             XCTAssertTrue(app.popUpButtons["audio.dsee"].isHittable)
             let hierarchy = XCTAttachment(string: app.debugDescription)
@@ -1589,7 +1588,6 @@ final class AppUITests: XCTestCase {
             try await measureResize(to: "anc")
             XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "isSelected == true"), object: app.buttons["noiseControl.anc"])], timeout: 3), .completed)
             XCTAssertLessThan(panel.frame.height, ambientHeight)
-            XCTAssertFalse(app.scrollViews["headphones.controlsScroll"].exists)
             let compact = XCTAttachment(screenshot: panel.screenshot())
             compact.name = "Main-panel-\(appearance)-anc"
             compact.lifetime = .keepAlways

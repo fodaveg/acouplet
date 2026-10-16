@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import os
 import SwiftUI
 
 @MainActor
@@ -23,6 +24,9 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     private var retriedControllers = Set<ObjectIdentifier>()
     private var dismissalObservations = Set<AnyCancellable>()
     private var foregroundApplicationPID: Int32?
+    private static let logger = Logger(subsystem: "dev.baglayan.Acouplet", category: "MenuBar")
+    /// Uptime at which the status item asked for the panel; cleared once the popover is shown (G9 timing marks).
+    private var openRequestedAt: TimeInterval?
 
     init(environment: AppEnvironment, showSettings: @escaping () -> Void) {
         let devices = environment.devices
@@ -231,6 +235,10 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
             return
         }
         wantsPopover = true
+        if openRequestedAt == nil {
+            openRequestedAt = ProcessInfo.processInfo.systemUptime
+            Self.logger.info("Panel open requested")
+        }
         preparePopoverContent()
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.contentViewController?.view.layoutSubtreeIfNeeded()
@@ -245,6 +253,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func closeMenu() {
         wantsPopover = false
+        openRequestedAt = nil
         if #available(macOS 27.0, *), let session = statusItem.expandedInterfaceSession {
             session.cancel()
         }
@@ -298,6 +307,11 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidShow(_ notification: Notification) {
+        if let requestedAt = openRequestedAt {
+            let milliseconds = Int((ProcessInfo.processInfo.systemUptime - requestedAt) * 1000)
+            Self.logger.info("Panel shown \(milliseconds, privacy: .public) ms after the open request")
+            openRequestedAt = nil
+        }
         retryVisibleControls()
     }
 
