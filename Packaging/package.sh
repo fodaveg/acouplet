@@ -15,7 +15,10 @@ distribution=production
 if [[ "$local_update" == true ]]; then distribution=development; fi
 no_sony_artwork="${ACOUPLET_NO_SONY_ARTWORK:-YES}"
 if [[ -n "${ACOUPLET_SONY_ARTWORK_DIR:-}" ]] && ! (( ${+ACOUPLET_NO_SONY_ARTWORK} )); then no_sony_artwork=NO; fi
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
+if [[ -z "${DEVELOPER_DIR:-}" ]]; then
+  if [[ -d /Applications/Xcode-beta.app/Contents/Developer ]]; then DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer; else DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"; fi
+fi
+export DEVELOPER_DIR
 package_name="Acouplet"
 package_dir="$repo_root/.build/package/$package_name"
 build_app="$repo_root/.build/Build/Products/Release/Acouplet.app"

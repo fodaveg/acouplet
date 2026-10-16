@@ -29,7 +29,10 @@ if [[ "$notarize" == true && -z "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
 fi
 notary_keychain=()
 if [[ -n "${NOTARY_KEYCHAIN_PATH:-}" ]]; then notary_keychain=(--keychain "$NOTARY_KEYCHAIN_PATH"); fi
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
+if [[ -z "${DEVELOPER_DIR:-}" ]]; then
+  if [[ -d /Applications/Xcode-beta.app/Contents/Developer ]]; then DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer; else DEVELOPER_DIR="$(/usr/bin/xcode-select -p)"; fi
+fi
+export DEVELOPER_DIR
 mkdir -p "$repo_root/.build/direct-release" "$repo_root/dist"
 release_dir="$(mktemp -d "$repo_root/.build/direct-release/release.XXXXXX")"
 source_record="$release_dir/source-inputs.json"
