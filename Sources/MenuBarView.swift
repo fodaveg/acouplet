@@ -838,13 +838,15 @@ struct LDACPermissionGuidance: View {
 
 /// Row for the `nil` selection of a Picker with an optional binding.
 ///
-/// It is always present, tagged with the exact `Optional<Value>.none` and never disabled: while the state is being
-/// reset the selection is briefly nil, and SwiftUI logs `Picker: the selection "nil" is invalid` if no enabled row
-/// carries that tag in that frame (G6). The binding's `set` must keep ignoring nil so nothing is written to the headphones.
-/// `current` only fixes the tag type; its value is not used.
+/// It appears only while `current` is nil, so pickers with a value show no extra row. It is tagged with the exact
+/// `Optional<Value>.none` and is never disabled: while the state is being reset the selection is briefly nil, and
+/// SwiftUI logs `Picker: the selection "nil" is invalid` when no enabled row carries that tag (G6). The binding's
+/// `set` must keep ignoring nil so nothing is written to the headphones.
 @ViewBuilder
 func unsetSelectionRow<Value: Hashable>(_ title: String, for current: Value?) -> some View {
-    Text(title).tag(Optional<Value>.none)
+    if current == nil {
+        Text(title).tag(Optional<Value>.none)
+    }
 }
 
 struct ConnectedHeadphonePicker: View {
