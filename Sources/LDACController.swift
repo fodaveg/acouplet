@@ -433,8 +433,13 @@ final class LDACController: ObservableObject {
         }
     }
 
-    private func resumeIfReady() {
-        guard devices?.isSystemSleeping != true else { return }
+    /// `fromRetryTimer` is true only for the automatic-retry timer; when it cannot start LDAC it records which
+    /// clauses failed (L1), so a silent no-op is visible in the log. Other callers stay silent.
+    private func resumeIfReady(fromRetryTimer: Bool = false) {
+        guard devices?.isSystemSleeping != true else {
+            if fromRetryTimer { recordRecovery("retry-blocked", reason: "failed=systemSleeping") }
+            return
+        }
         reconcileConnectionPreferences()
         for (address, request) in deferredConnectionModes where address != requestedAddress && preferenceRestoreTasks[address] == nil {
             guard let headphones = devices?.controller(for: address), headphones.isDeviceConnected, headphones.isReady,
@@ -448,10 +453,46 @@ final class LDACController: ObservableObject {
               devices?.selectedAddress == address, headphones.isDeviceConnected,
               deviceUnavailableReason(forAddress: address) == nil, !headphones.ldacRequiresMultipointOff,
               let resumeOutputUID, audioRoute?.route?.uid == resumeOutputUID,
-              headphones.hasCurrentMusicSourceContext(for: IOBluetoothHostController.default()?.addressAsString()) else { return }
+              headphones.hasCurrentMusicSourceContext(for: IOBluetoothHostController.default()?.addressAsString()) else {
+            if fromRetryTimer { recordRetryBlocked() }
+            return
+        }
         refreshDriverState()
-        guard driverState == .current, helpers.isAvailable else { return }
+        guard driverState == .current, helpers.isAvailable else {
+            if fromRetryTimer {
+                recordRecovery("retry-blocked", reason: "failed=" + [driverState == .current ? nil : "driverNotCurrent",
+                                                                       helpers.isAvailable ? nil : "helpersUnavailable"].compactMap { $0 }.joined(separator: ","))
+            }
+            return
+        }
         start(address)
+    }
+
+    /// Names the `resumeIfReady` clauses that currently fail. Clause names only, never addresses.
+    private func recordRetryBlocked() {
+        let address = requestedAddress
+        let headphones = address.flatMap { devices?.controller(for: $0) }
+        var failed: [String] = []
+        if devices?.isSystemSleeping == true { failed.append("systemSleeping") }
+        if state != .waitingForDevice { failed.append("state=\(state)") }
+        if isSessionRunning { failed.append("sessionRunning") }
+        if cleanupTask != nil { failed.append("cleanupTask") }
+        if recoveryTask != nil { failed.append("recoveryTask") }
+        if address == nil { failed.append("noRequestedAddress") }
+        if let address, preferenceRestoreTasks[address] != nil { failed.append("preferenceRestoreTask") }
+        if address != nil, headphones == nil { failed.append("noController") }
+        if let address {
+            if devices?.selectedAddress != address { failed.append("notSelected") }
+            if headphones?.isDeviceConnected != true { failed.append("notConnected") }
+            if deviceUnavailableReason(forAddress: address) != nil { failed.append("deviceUnavailable") }
+            if headphones?.ldacRequiresMultipointOff == true { failed.append("multipointOn") }
+        }
+        if resumeOutputUID == nil { failed.append("noResumeOutput") }
+        else if audioRoute?.route?.uid != resumeOutputUID { failed.append("macOutputChanged") }
+        if headphones?.hasCurrentMusicSourceContext(for: IOBluetoothHostController.default()?.addressAsString()) != true {
+            failed.append("noMusicContext")
+        }
+        recordRecovery("retry-blocked", reason: "failed=" + failed.joined(separator: ","))
     }
 
     private func start(_ address: String) {
@@ -1243,7 +1284,7 @@ final class LDACController: ObservableObject {
             self.endRetryWait(taskID)
             guard self.requestedAddress == address, self.state == .waitingForDevice, !self.isSessionRunning else { return }
             self.recordRecovery("retry-due", reason: "attempt=\(self.recoveryAttempt)")
-            self.resumeIfReady()
+            self.resumeIfReady(fromRetryTimer: true)
         }
     }
 
