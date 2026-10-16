@@ -82,6 +82,7 @@ final class SessionEvents {
             case .failed: "failed"
             case .active: "active"
             case .formatChanged: "formatChanged"
+            case .ldacEndpoint(let supported): supported ? "ldacEndpoint" : "noLDACEndpoint"
             default: "other"
             }
         }
@@ -504,7 +505,9 @@ extension LDACNativeSession {
             }.first
             try require(message == session.failure, "LDAC availability instructions were replaced by a generic failure")
         }
-        try require(events.names == (rejected ? [recoverable ? "connectionLost" : "failed"] : []),
+        // LDAC_UNAVAILABLE without a listed LDAC endpoint also reports that no endpoint exists.
+        let expected = (unavailable && rejected ? ["noLDACEndpoint"] : []) + (rejected ? [recoverable ? "connectionLost" : "failed"] : [])
+        try require(events.names == expected,
             "Probe events were missing, duplicated, or reactivated playback: \(events.names)")
     }
 

@@ -179,7 +179,7 @@ struct SettingsView: View {
             Section("Experimental Features") {
                 Toggle("Show LDAC controls", isOn: $settings.experimentalLDACEnabled)
                     .accessibilityIdentifier("experimental.ldac")
-                if settings.experimentalLDACEnabled {
+                if settings.experimentalLDACEnabled, ldac.support(forAddress: headphones.address) != .unsupported {
                     Picker("Sample Rate", selection: $settings.ldacConfiguration.sampleRate) {
                         ForEach(LDACSampleRate.allCases, id: \.self) { rate in
                             Text(rate.displayName).tag(rate)
@@ -197,8 +197,8 @@ struct SettingsView: View {
                     .accessibilityIdentifier("ldac.quality")
                     if !ldac.isSessionRunning { LDACDriverGuidance() }
                 }
-                if settings.experimentalLDACEnabled, ldac.targetAddress == headphones.address,
-                   ldac.audioCaptureAccess == .permissionRequired {
+                if settings.experimentalLDACEnabled, ldac.support(forAddress: headphones.address) != .unsupported,
+                   ldac.targetAddress == headphones.address, ldac.audioCaptureAccess == .permissionRequired {
                     LDACPermissionGuidance()
                 }
                 if hasInstalledLDACDriver {

@@ -33,6 +33,7 @@ enum Generation { case v1, v2 }
 enum Model { case unknown, wfXM3, whCH720N, whXM4, wfXM5; var name: String { "fixture" } }
 struct LDACFormat: Equatable { var value = 1 }
 enum LDACState: Equatable { case off, requested, waitingForDevice, connecting, active(LDACFormat), stopping, failed(String) }
+enum LDACSupport { case supported, unsupported, unknown; func allowsStart(requested: Bool) -> Bool { requested && self != .unsupported } }
 enum LDACAudioCaptureAccess { case unchecked, checking, ready, permissionRequired }
 struct LDACConfiguration { var sampleRate = 48000 }
 struct LDACPriorityControl {}
@@ -233,7 +234,7 @@ final class LDACNativeSession {
     struct Helpers { var isAvailable = true }
     struct Completion { var message: String?; var canRetry = false; var requiresAttention = false; var targetDisconnected = false; var waitForReconnect = false }
     enum Event {
-        case handoffReady, connecting, active(LDACFormat), formatChanged(LDACFormat), gainApplied(Double)
+        case handoffReady, connecting, active(LDACFormat), formatChanged(LDACFormat), gainApplied(Double), ldacEndpoint(Bool)
         case audioCaptureAccess(LDACAudioCaptureAccess), failed(String), connectionLost(String), finished(Completion)
     }
     let id: UUID
@@ -328,6 +329,8 @@ final class Controller: ObservableObject {
     var events: [String] = []
     func record(_ event: String, reason: String) { events.append(event) }
     func recordRecovery(_ event: String, reason: String) { recoveryEvents.append("\(event) \(reason)") }
+    func support(forAddress address: String) -> LDACSupport { .unknown }
+    func recordDiscoveredSupport(_ supported: Bool, address: String) {}
     __METHODS__
     struct ControlError: LocalizedError {
         let message: String

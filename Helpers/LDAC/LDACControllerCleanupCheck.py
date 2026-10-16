@@ -18,6 +18,7 @@ import Foundation
 import Combine
 
 enum LDACState: Equatable { case off, requested, waitingForDevice, connecting, stopping, failed(String) }
+enum LDACSupport { case supported, unsupported, unknown; func allowsStart(requested: Bool) -> Bool { requested && self != .unsupported } }
 enum LDACAudioCaptureAccess { case checking, unchecked }
 struct LDACConfiguration: Equatable { var value = 0 }
 enum SonyBLEIdentity {
@@ -239,6 +240,7 @@ final class Controller: ObservableObject {
         var errorDescription: String? { message }
         init(_ message: String) { self.message = message }
     }
+    func support(forAddress address: String) -> LDACSupport { .unknown }
 __METHODS__
 }
 

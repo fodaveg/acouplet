@@ -6867,6 +6867,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             let hex = { (functions: Set<UInt8>) in functions.sorted().map { String(format: "%02X", $0) }.joined(separator: " ") }
             let reported = hex(Set(payload.dropFirst(3)))
             let hidden = hex(Set(payload.dropFirst(3)).subtracting(controls.supportedFunctions))
+            logSupportFunctions(generation: "v1", table: 1, functions: Set(payload.dropFirst(3)))
             Self.logger.info("MDR v1 support functions=\(reported, privacy: .public) hidden=\(hidden, privacy: .public) model=\(self.deviceModel.rawValue, privacy: .public)")
             legacyControls = controls
             multipoint = SonyMultipoint(legacySupportedFunctions: controls.supportedFunctions)
@@ -7078,6 +7079,14 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
     }
 
+    /// Persists (`.notice`) the support-function list the headphones just reported, with no Bluetooth address. It only
+    /// logs what the app already receives; it adds no read or write.
+    private func logSupportFunctions(generation: String, table: Int, functions: Set<UInt8>) {
+        let line = SonySupportFunctionsLog.line(generation: generation, table: table, model: deviceModel.name,
+                                                protocolVersion: protocolVersion, functions: functions)
+        Self.logger.notice("\(line, privacy: .public)")
+    }
+
     private func parseSupportFunctions(_ payload: [UInt8], type: UInt8) {
         guard protocolInformation?.generation == .v2,
               payload.count >= 3, payload[1] == 0x00,
@@ -7102,6 +7111,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             invalidateWearingStatus()
             wearingStatus = SonyWearingStatus(supportedFunctions: functions)
             supportedFunctions2 = functions
+            logSupportFunctions(generation: "v2", table: 2, functions: functions)
             let previousCare = powerFeatures.batteryCare?.includesThreshold
             powerFeatures.updateSupportedFunctions(supportedFunctions, supportedFunctions2: functions)
             if previousCare != powerFeatures.batteryCare?.includesThreshold {
@@ -7132,6 +7142,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         supportFunctionsReadTransmitted = false
         let supported = Self.asmByFunction.first(where: { functions.contains($0.function) })
         supportedFunctions = functions
+        logSupportFunctions(generation: "v2", table: 1, functions: functions)
         equalizer = SonyEqualizer(supportedFunctions: functions)
         earTipFit = SonyEarTipFit(supportedFunctions: functions)
         headGesturePractice = SonyHeadGesturePractice(supportedFunctions: functions)

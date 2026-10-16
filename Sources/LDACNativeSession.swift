@@ -145,6 +145,8 @@ final class LDACNativeSession: @unchecked Sendable {
         case active(LDACFormat)
         case formatChanged(LDACFormat)
         case gainApplied(Double)
+        /// What the AVDTP DISCOVER of this session found: `true` when the sink listed the LDAC endpoint.
+        case ldacEndpoint(Bool)
         case audioCaptureAccess(LDACAudioCaptureAccess)
         case failed(String)
         case connectionLost(String)
@@ -222,6 +224,7 @@ final class LDACNativeSession: @unchecked Sendable {
     private var preparedSent = false
     private var mediaReady: (cid: Int, mtu: Int)?
     private var readySent = false
+    private var sawLDACEndpoint = false
     private var captureReady = false
     private var pcmReady = false
     private var startAccepted = false
@@ -581,7 +584,12 @@ final class LDACNativeSession: @unchecked Sendable {
             if signalingGate.cid == nil, !shouldStop,
                LDACChannelGate.captures("^NO_PLAYBACK realCID=0000 owned=(?:0x0|\\(nil\\)) openExpired=0 openError=(-?[0-9]+)$", line) != nil {
                 fail("Bluetooth could not open the LDAC audio connection. Try LDAC again.")
+            } else if line.hasPrefix("LDAC SEID=") {
+                sawLDACEndpoint = true
+                emit(.ldacEndpoint(true))
             } else if line == "LDAC_UNAVAILABLE rate=\(configuration.sampleRate.rawValue) channels=2" && !shouldStop {
+                // Unavailable at the requested rate is not the same as no endpoint: only the second rules LDAC out.
+                if !sawLDACEndpoint { emit(.ldacEndpoint(false)) }
                 failForUser(String(localized: "The headphones did not offer a compatible LDAC stream. Check their audio settings, then retry."))
             } else if line == "PREPARE_MEDIA" && !shouldStop {
                 guard children["media"] == nil else { throw LDACSessionError("LDAC requested repeated media preparation.") }

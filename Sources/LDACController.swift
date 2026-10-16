@@ -15,6 +15,8 @@ final class LDACController: ObservableObject {
     @Published private(set) var isAwaitingAutomaticRetry = false
     @Published private(set) var audioCaptureAccess: LDACAudioCaptureAccess = .unchecked
     @Published private(set) var driverState: LDACDriverInstaller.State
+    /// Result of the last AVDTP DISCOVER per normalized address; see `LDACSupport`.
+    @Published private(set) var discoveredSupport: [String: Bool]
     @Published private(set) var driverInstallationError: String?
     @Published private(set) var isOpeningDriverInstaller = false
     /// Headphones whose LDAC request waits for the user to choose between multipoint and LDAC.
@@ -98,6 +100,7 @@ final class LDACController: ObservableObject {
          isClassicConnected: @escaping (String) -> Bool = { IOBluetoothDevice(addressString: $0)?.isClassicConnected() == true }) {
         self.bundle = bundle
         self.defaults = defaults
+        discoveredSupport = LDACSupportStore(defaults: defaults).all
         self.inspectDriver = inspectDriver
         self.isDriverInspectionEnabled = isDriverInspectionEnabled
         self.isClassicConnected = isClassicConnected
@@ -260,8 +263,25 @@ final class LDACController: ObservableObject {
         return nil
     }
 
+    /// Whether these headphones offer LDAC, from the one decision in `LDACSupport.decide`.
+    func support(forAddress address: String) -> LDACSupport {
+        LDACSupport.decide(modelImpliesLDAC: devices?.controller(for: address)?.deviceModel.offersLDACOnlyWithoutMultipoint == true,
+                           discovered: SonyBLEIdentity.normalizedAddress(address).flatMap { discoveredSupport[$0] })
+    }
+
+    private func recordDiscoveredSupport(_ supported: Bool, address: String) {
+        guard discoveredSupport[address] != supported else { return }
+        LDACSupportStore(defaults: defaults).record(supported, forAddress: address)
+        discoveredSupport[address] = supported
+        record("ldac-support", reason: supported ? "endpoint listed" : "no endpoint listed")
+        if !supported, support(forAddress: address) == .unsupported, requestedAddress == address {
+            // The request for LDAC does not outlive the finding: no automatic retry and no restart.
+            requestedAddress = nil
+        }
+    }
+
     func canEnable(forAddress address: String) -> Bool {
-        deviceUnavailableReason(forAddress: address) == nil && helpers.isAvailable && !isSessionRunning
+        support(forAddress: address) != .unsupported && deviceUnavailableReason(forAddress: address) == nil && helpers.isAvailable && !isSessionRunning
             && preferenceRestoreTasks[address] == nil
     }
 
@@ -270,6 +290,7 @@ final class LDACController: ObservableObject {
         if enabled {
             guard requestedAddress != address else { return }
             guard preferenceRestoreTasks[address] == nil else { return }
+            guard support(forAddress: address).allowsStart(requested: true) else { return }
             guard deviceUnavailableReason(forAddress: address) == nil else { return }
             if let configuration { requestedConfiguration = configuration }
             if !isSessionRunning {
@@ -451,6 +472,7 @@ final class LDACController: ObservableObject {
               let address = requestedAddress, preferenceRestoreTasks[address] == nil,
               let headphones = devices?.controller(for: address),
               devices?.selectedAddress == address, headphones.isDeviceConnected,
+              support(forAddress: address).allowsStart(requested: true),
               deviceUnavailableReason(forAddress: address) == nil, !headphones.ldacRequiresMultipointOff,
               let resumeOutputUID, audioRoute?.route?.uid == resumeOutputUID,
               headphones.hasCurrentMusicSourceContext(for: IOBluetoothHostController.default()?.addressAsString()) else {
@@ -832,6 +854,8 @@ final class LDACController: ObservableObject {
                     self.transportFormat = format
                     if case .active = self.state { self.state = .active(format) }
                 }
+            case let .ldacEndpoint(supported):
+                self.recordDiscoveredSupport(supported, address: address)
             case let .gainApplied(gain):
                 self.record("gain-applied", reason: "gain=\(gain)")
             case let .audioCaptureAccess(access):

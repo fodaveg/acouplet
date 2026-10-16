@@ -274,7 +274,8 @@ struct MenuBarView: View {
 
     #if !ACOUPLET_PUBLIC_APIS_ONLY
     private var showsLDACControl: Bool {
-        showsLDACSession || (settings.experimentalLDACEnabled && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
+        showsLDACSession || (settings.experimentalLDACEnabled && ldac.support(forAddress: headphones.address) != .unsupported
+            && ((showsHeadphoneControls && ldac.canEnable(forAddress: headphones.address))
             || (ldac.targetAddress == headphones.address && ldac.state != .off)))
     }
 
