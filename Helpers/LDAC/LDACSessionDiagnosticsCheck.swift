@@ -4,13 +4,15 @@ import Foundation
 @main
 enum LDACSessionDiagnosticsCheck {
     static func main() throws {
+        // The fixture folders carry dates from 1970, so these checks keep the count limit and ignore the age.
+        let countOnly = LDACNativeSession.DiagnosticsRetention(maxAge: .infinity, maxCount: 7, maxBytes: .max)
         if CommandLine.arguments.count == 3, ["--live", "--finish"].contains(CommandLine.arguments[1]) {
             let directory = URL(fileURLWithPath: CommandLine.arguments[2])
-            let active = try LDACNativeSession.beginDiagnostics(in: directory)
+            let active = try LDACNativeSession.beginDiagnostics(in: directory, retention: countOnly)
             try FileHandle.standardOutput.write(contentsOf: Data([1]))
             withExtendedLifetime(active) { _ = FileHandle.standardInput.readDataToEndOfFile() }
             if CommandLine.arguments[1] == "--finish" {
-                try LDACNativeSession.completeDiagnostics(in: directory, releasing: active)
+                try LDACNativeSession.completeDiagnostics(in: directory, releasing: active, retention: countOnly)
             }
             return
         }
@@ -73,12 +75,12 @@ enum LDACSessionDiagnosticsCheck {
         try Data().write(to: unrelated.appendingPathComponent("completed"))
         let linked = root.appendingPathComponent(UUID().uuidString)
         try manager.createSymbolicLink(at: linked, withDestinationURL: unrelated)
-        let currentLock = try LDACNativeSession.beginDiagnostics(in: current)
+        let currentLock = try LDACNativeSession.beginDiagnostics(in: current, retention: countOnly)
         defer { try? currentLock.close() }
         for (index, directory) in inactive.enumerated() {
             precondition(manager.fileExists(atPath: directory.path) == (index >= 3))
         }
-        try LDACNativeSession.completeDiagnostics(in: current)
+        try LDACNativeSession.completeDiagnostics(in: current, retention: countOnly)
         for (index, directory) in inactive.enumerated() {
             precondition(manager.fileExists(atPath: directory.path) == (index >= 3))
         }
@@ -94,12 +96,12 @@ enum LDACSessionDiagnosticsCheck {
         }
         precondition(kill(children[0].processIdentifier, SIGKILL) == 0)
         children[0].waitUntilExit()
-        try LDACNativeSession.completeDiagnostics(in: current)
+        try LDACNativeSession.completeDiagnostics(in: current, retention: countOnly)
         precondition(!manager.fileExists(atPath: active.path))
         precondition(manager.fileExists(atPath: concurrent.path))
         for directory in inactive.suffix(7) { precondition(manager.fileExists(atPath: directory.path)) }
         try legacyHandle.close()
-        try LDACNativeSession.completeDiagnostics(in: current)
+        try LDACNativeSession.completeDiagnostics(in: current, retention: countOnly)
         let legacyContents = try Data(contentsOf: legacyLog)
         precondition(legacyContents == Data("legacy diagnostics".utf8))
         precondition(!manager.fileExists(atPath: legacy.appendingPathComponent("completed").path))
@@ -150,8 +152,42 @@ enum LDACSessionDiagnosticsCheck {
         precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) == nil && made == 1)
         defaults.removeObject(forKey: LDACPlaybackPriority.disabledKey)
         precondition(LDACPlaybackPriority.control(in: defaults, { made += 1; return control }) != nil && made == 2)
+        try checkRetentionByAgeAndSize(in: root)
         try checkSessionLogRotation(in: root)
-        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths; the playback priority A/B switch skips the driver request only while set; a full session log moves to session.log.1 and a new one starts")
+        print("LDAC diagnostic retention checks passed: mixed completed/managed-orphan limit, a week of sessions with count and size caps, legacy preservation, concurrent live locks and completion, forced-exit recovery, unrelated paths; the playback priority A/B switch skips the driver request only while set; a full session log moves to session.log.1 and a new one starts")
+    }
+
+    /// A week of sessions is kept, the oldest go first when the count or size cap is passed, and the running
+    /// session is never removed (L7).
+    private static func checkRetentionByAgeAndSize(in root: URL) throws {
+        let manager = FileManager.default
+        let base = root.appendingPathComponent("retention", isDirectory: true)
+        try manager.createDirectory(at: base, withIntermediateDirectories: false)
+        let day: TimeInterval = 24 * 3600
+        func session(ageDays: Double, bytes: Int) throws -> URL {
+            let directory = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try manager.createDirectory(at: directory, withIntermediateDirectories: false)
+            try Data(count: bytes).write(to: directory.appendingPathComponent("session.log"))
+            let marker = directory.appendingPathComponent("completed")
+            try Data().write(to: marker)
+            let date = Date(timeIntervalSinceNow: -ageDays * day)
+            try manager.setAttributes([.modificationDate: date], ofItemAtPath: marker.path)
+            try manager.setAttributes([.modificationDate: date], ofItemAtPath: directory.path)
+            return directory
+        }
+        let old = try session(ageDays: 8, bytes: 10)
+        let recent = try [6.5, 3, 1, 0.1].map { try session(ageDays: $0, bytes: 10) }
+        let current = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let lock = try LDACNativeSession.beginDiagnostics(in: current)
+        precondition(!manager.fileExists(atPath: old.path), "A session older than a week must go")
+        for directory in recent { precondition(manager.fileExists(atPath: directory.path), "A session under a week old must stay") }
+        precondition(manager.fileExists(atPath: current.path))
+        // Size cap: 30 bytes allowed, 10 each, so the three newest stay and the oldest goes first.
+        let sized = LDACNativeSession.DiagnosticsRetention(maxAge: 7 * day, maxCount: 200, maxBytes: 30)
+        try LDACNativeSession.completeDiagnostics(in: current, releasing: lock, retention: sized)
+        precondition(!manager.fileExists(atPath: recent[0].path))
+        for directory in recent.dropFirst() { precondition(manager.fileExists(atPath: directory.path)) }
+        precondition(manager.fileExists(atPath: current.path), "The finished current session is never removed by its own prune")
     }
 
     /// A full session log keeps its lines in `session.log.1`, replacing an older one, and logging goes on in a new

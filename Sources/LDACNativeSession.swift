@@ -1224,22 +1224,36 @@ final class LDACNativeSession: @unchecked Sendable {
                                   waitForReconnect: (originalConnectionEnded || targetUnavailableBeforeRestore) && !nativeAudioRestored)))
     }
 
-    static func beginDiagnostics(in directory: URL) throws -> FileHandle {
+    /// Which finished session folders `LDAC Sessions` keeps (L7). A week of sessions is needed to compare
+    /// connection drops by hour of day, and every abort and restore leaves its own folder, so a plain count of
+    /// eight lost them within a day. Oldest folders go first; the running session and any locked one never go.
+    struct DiagnosticsRetention {
+        /// Finished sessions older than this are removed.
+        var maxAge: TimeInterval = 7 * 24 * 3600
+        /// Safety cap on finished session folders kept.
+        var maxCount = 200
+        /// Safety cap on their total size. A session log is at most 8 MiB plus its `.1`.
+        var maxBytes: Int64 = 1 << 30
+        static let standard = DiagnosticsRetention()
+    }
+
+    static func beginDiagnostics(in directory: URL, retention policy: DiagnosticsRetention = .standard) throws -> FileHandle {
         let retention = try lockDiagnostics(at: directory.deletingLastPathComponent().appendingPathComponent("retention.lock"))
         defer { try? retention.close() }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
         let active = try lockDiagnostics(at: directory.appendingPathComponent("active.lock"), nonblocking: true)
-        try pruneDiagnostics(in: directory)
+        try pruneDiagnostics(in: directory, policy: policy)
         return active
     }
 
-    static func completeDiagnostics(in directory: URL, releasing active: FileHandle? = nil) throws {
+    static func completeDiagnostics(in directory: URL, releasing active: FileHandle? = nil,
+                                    retention policy: DiagnosticsRetention = .standard) throws {
         let retention = try lockDiagnostics(at: directory.deletingLastPathComponent().appendingPathComponent("retention.lock"))
         defer { try? retention.close() }
         try Data().write(to: directory.appendingPathComponent("completed"), options: .atomic)
         try active?.close()
-        try pruneDiagnostics(in: directory)
+        try pruneDiagnostics(in: directory, policy: policy)
     }
 
     private static func lockDiagnostics(at url: URL, nonblocking: Bool = false) throws -> FileHandle {
@@ -1254,7 +1268,7 @@ final class LDACNativeSession: @unchecked Sendable {
         return handle
     }
 
-    private static func pruneDiagnostics(in directory: URL) throws {
+    private static func pruneDiagnostics(in directory: URL, policy: DiagnosticsRetention, now: Date = Date()) throws {
         let manager = FileManager.default
         let directories = try manager.contentsOfDirectory(at: directory.deletingLastPathComponent(),
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey])
@@ -1276,7 +1290,19 @@ final class LDACNativeSession: @unchecked Sendable {
             let date = completedDate ?? directoryDate
             return (candidate, date)
         }.sorted { $0.date == $1.date ? $0.url.lastPathComponent > $1.url.lastPathComponent : $0.date > $1.date }
-        for candidate in inactive.dropFirst(7) {
+        // Newest first: keep while the folder is recent enough and the count and size caps still hold.
+        var keptBytes: Int64 = 0
+        var removable: [(url: URL, date: Date)] = []
+        for (index, candidate) in inactive.enumerated() {
+            let size = diagnosticsSize(of: candidate.url)
+            if index >= policy.maxCount || now.timeIntervalSince(candidate.date) > policy.maxAge
+                || keptBytes > policy.maxBytes - size {
+                removable.append(candidate)
+            } else {
+                keptBytes += size
+            }
+        }
+        for candidate in removable.reversed() {
             let activeURL = candidate.url.appendingPathComponent("active.lock")
             let active: FileHandle?
             if manager.fileExists(atPath: activeURL.path) {
@@ -1287,6 +1313,13 @@ final class LDACNativeSession: @unchecked Sendable {
             }
             defer { try? active?.close() }
             try manager.removeItem(at: candidate.url)
+        }
+    }
+
+    private static func diagnosticsSize(of directory: URL) -> Int64 {
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        return files.reduce(Int64(0)) { total, file in
+            total + Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
     }
 
