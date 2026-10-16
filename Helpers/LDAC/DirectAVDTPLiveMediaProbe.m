@@ -668,6 +668,106 @@ static BOOL FrameHeadersMatch(const uint8_t *encoded, NSUInteger length, int fra
     return YES;
 }
 
+// L7: encoded packets wait here between the encoder and the socket. A Bluetooth link can stop for 70 to 200 ms
+// (radio time for another multipoint device); with one packet in flight the sender then stopped encoding, the PCM
+// ring filled and PCM_SKIP discarded audio. Now the sender keeps encoding and sending in order while the audio not
+// yet drained from the socket stays within the PCM reserve (250 ms). Above that, the PCM ring absorbs and
+// PCM_SKIP drops the oldest PCM as before; an encoded packet is never dropped.
+//
+// Three counters grow without bound and index the slots modulo LiveQueueSlots: `tail` (encoded), `send` (written to
+// the socket) and `head` (drained from the socket). In flight in the socket is `sentBytes - drainedBytes`, which is
+// read from the writable space of EVFILT_WRITE: `capacity - writable`, with `capacity` the largest space seen (an
+// empty socket).
+#define LiveQueueSlots 256
+
+typedef struct {
+    uint8_t bytes[LDACBT_MAX_NBYTES + 13];
+    NSUInteger length;
+    uint64_t samples;
+    uint64_t rtpEnd;
+    LDACFrameFormat format;
+    double enqueuedAt, sentAt, lateness;
+    BOOL gainAck, held;
+    NSUInteger sentEnd;
+} LiveQueuePacket;
+
+typedef struct {
+    LiveQueuePacket *slots;
+    uint64_t head, send, tail;
+    NSUInteger sentBytes, drainedBytes;
+    long capacity;
+    uint64_t unsentSamples, undrainedSamples;
+} LiveQueue;
+
+static BOOL LiveQueueInit(LiveQueue *queue, long capacity) {
+    memset(queue, 0, sizeof(*queue));
+    queue->slots = calloc(LiveQueueSlots, sizeof(LiveQueuePacket));
+    queue->capacity = capacity;
+    return queue->slots != NULL;
+}
+
+static void LiveQueueFree(LiveQueue *queue) {
+    free(queue->slots);
+    queue->slots = NULL;
+}
+
+static LiveQueuePacket *LiveQueueAt(LiveQueue *queue, uint64_t index) {
+    return &queue->slots[index % LiveQueueSlots];
+}
+
+/// True when the audio not yet drained is above `capSamples`, or no slot is left: the sender must wait.
+static BOOL LiveQueueFull(const LiveQueue *queue, uint64_t capSamples) {
+    return queue->undrainedSamples > capSamples || queue->tail - queue->head >= LiveQueueSlots - 1;
+}
+
+static LiveQueuePacket *LiveQueueSlot(LiveQueue *queue) {
+    return LiveQueueAt(queue, queue->tail);
+}
+
+static void LiveQueueCommit(LiveQueue *queue) {
+    LiveQueuePacket *packet = LiveQueueAt(queue, queue->tail);
+    queue->unsentSamples += packet->samples;
+    queue->undrainedSamples += packet->samples;
+    queue->tail++;
+}
+
+/// Records the writable space of the socket. Returns YES when more bytes have left it since the last call.
+static BOOL LiveQueueObserve(LiveQueue *queue, long writable) {
+    if (writable > queue->capacity) queue->capacity = writable;
+    NSUInteger inflight = (NSUInteger)(queue->capacity - writable);
+    if (inflight > queue->sentBytes) return NO;
+    NSUInteger drained = queue->sentBytes - inflight;
+    if (drained <= queue->drainedBytes) return NO;
+    queue->drainedBytes = drained;
+    return YES;
+}
+
+static LiveQueuePacket *LiveQueueNextDrained(LiveQueue *queue) {
+    if (queue->head >= queue->send) return NULL;
+    LiveQueuePacket *packet = LiveQueueAt(queue, queue->head);
+    return packet->sentEnd <= queue->drainedBytes ? packet : NULL;
+}
+
+static void LiveQueuePopDrained(LiveQueue *queue) {
+    queue->undrainedSamples -= LiveQueueAt(queue, queue->head)->samples;
+    queue->head++;
+}
+
+/// The oldest unsent packet, if the socket has room for all of it (a stream write of that size is not split).
+static LiveQueuePacket *LiveQueueNextToSend(LiveQueue *queue, long writable) {
+    if (queue->send >= queue->tail) return NULL;
+    LiveQueuePacket *packet = LiveQueueAt(queue, queue->send);
+    return writable >= (long)packet->length ? packet : NULL;
+}
+
+static void LiveQueueMarkSent(LiveQueue *queue) {
+    LiveQueuePacket *packet = LiveQueueAt(queue, queue->send);
+    queue->sentBytes += packet->length;
+    packet->sentEnd = queue->sentBytes;
+    queue->unsentSamples -= packet->samples;
+    queue->send++;
+}
+
 static BOOL EncodePacket(HANDLE_LDAC_BT encoder, LDACProfile profile, float *pcm,
                          NSUInteger sequence, uint64_t timestamp, NSUInteger mtu, NSUInteger baseline,
                          uint8_t *packet, NSUInteger *packetLength, int *frames, LDACFrameFormat *latestFrame) {
@@ -836,11 +936,70 @@ static BOOL MatrixChecks(void) {
     return passed;
 }
 
+// A fake socket (8192 bytes, drained by a simulated link) shows the queue holds a link stall without losing
+// or reordering packets, and that above the cap the sender is told to wait instead of dropping encoded audio.
+static BOOL LiveQueueSimulate(int stallStart, int stallLength, BOOL *blocked, uint64_t *peakSamples) {
+    const uint64_t packetSamples = 144, capSamples = 12000; // 3 ms of audio at 48 kHz, a 250 ms cap
+    const NSUInteger packetLength = 300;
+    const long socketCapacity = 8192;
+    LiveQueue queue;
+    if (!LiveQueueInit(&queue, socketCapacity)) return NO;
+    long socketBytes = 0;
+    uint32_t pushed = 0, nextOnLink = 0;
+    BOOL ordered = YES;
+    *blocked = NO;
+    *peakSamples = 0;
+    for (int millisecond = 0; millisecond < 4100; millisecond++) { // the last 100 ms only drain
+        if (millisecond < 4000 && millisecond % 3 == 0) {
+            if (LiveQueueFull(&queue, capSamples)) *blocked = YES; // the real sender waits here, the PCM ring absorbs
+            else {
+                LiveQueuePacket *slot = LiveQueueSlot(&queue);
+                memset(slot, 0, sizeof(*slot));
+                memcpy(slot->bytes, &pushed, sizeof(pushed));
+                slot->length = packetLength;
+                slot->samples = packetSamples;
+                pushed++;
+                LiveQueueCommit(&queue);
+            }
+        }
+        LiveQueueObserve(&queue, socketCapacity - socketBytes);
+        LiveQueuePacket *done;
+        while ((done = LiveQueueNextDrained(&queue))) LiveQueuePopDrained(&queue);
+        LiveQueuePacket *next;
+        long writable = socketCapacity - socketBytes;
+        while ((next = LiveQueueNextToSend(&queue, writable))) {
+            uint32_t sequence;
+            memcpy(&sequence, next->bytes, sizeof(sequence));
+            ordered &= sequence == nextOnLink++;
+            writable -= (long)next->length;
+            socketBytes += (long)next->length;
+            LiveQueueMarkSent(&queue);
+        }
+        if (queue.unsentSamples > *peakSamples) *peakSamples = queue.unsentSamples;
+        BOOL stalled = millisecond >= stallStart && millisecond < stallStart + stallLength;
+        if (!stalled) socketBytes = MAX(0L, socketBytes - 150);
+    }
+    BOOL passed = ordered && nextOnLink == pushed && queue.head == queue.tail && queue.undrainedSamples == 0 &&
+        queue.unsentSamples == 0 && socketBytes == 0;
+    LiveQueueFree(&queue);
+    return passed;
+}
+
+static BOOL LiveQueueChecks(void) {
+    BOOL blocked = NO;
+    uint64_t peak = 0;
+    BOOL passed = LiveQueueSimulate(1000, 200, &blocked, &peak) && !blocked && peak > 0 && peak <= 12000;
+    passed &= LiveQueueSimulate(1000, 70, &blocked, &peak) && !blocked;
+    // A 600 ms stall passes the 250 ms cap: the sender must wait (PCM_SKIP territory), still in order, nothing lost.
+    passed &= LiveQueueSimulate(1000, 600, &blocked, &peak) && blocked && peak <= 12000 + 144;
+    return passed;
+}
+
 static BOOL SelfTest(void) {
     float input[256] = {0};
     float output[256] = {0};
     input[0] = 1; input[1] = -1;
-    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && RealtimeChecks() && BreachStreakChecks() &&
+    BOOL passed = RecoveryChecks() && ContinuousPCMChecks() && PreparedPCMChecks() && PreparedPCMStopChecks() && RealtimeChecks() && BreachStreakChecks() && LiveQueueChecks() &&
         ConvertPCM((const uint8_t *)input, 0.5, output);
     passed &= output[0] == 0.5 && output[1] == -0.5 && output[255] == 0;
     const float invalid[] = {NAN, INFINITY, -INFINITY};
@@ -1326,10 +1485,10 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
            realtimeStatus, realtimeEffective, realtimePriority, realtimeBudget.period, realtimeBudget.computation,
            realtimeBudget.constraint);
     LDACProfile profile = probe.profile;
-    LDACFrameFormat transmittedFormat = {profile.frameBytes, profile.bitrateKbps};
-    LDACAdaptivePolicy adaptivePolicy = LDACAdaptivePolicyInit();
-    BOOL adaptiveSourceReady = YES;
-    uint64_t adaptiveSkippedBytes = probe.pcmSkippedBytes;
+    __block LDACFrameFormat transmittedFormat = {profile.frameBytes, profile.bitrateKbps};
+    __block LDACAdaptivePolicy adaptivePolicy = LDACAdaptivePolicyInit();
+    __block BOOL adaptiveSourceReady = YES;
+    __block uint64_t adaptiveSkippedBytes = probe.pcmSkippedBytes;
     int result = 5;
     int fd = owned.socketFD;
     NSData *native = [probe.output propertyForKey:(__bridge NSString *)kCFStreamPropertySocketNativeHandle];
@@ -1342,9 +1501,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     int originalLowWater = 0;
     int originalNoSigPipe = 0;
     BOOL flagsChanged = NO, lowWaterChanged = NO, noSigPipeChanged = NO;
-    NSUInteger sentPackets = 0, drainedPackets = 0, sentBytes = 0;
-    uint64_t sentSamples = 0, drainedSamples = 0, sourceSamples = 0, generatedSamples = 0;
-    uint64_t sentRTPSamples = 0;
+    __block NSUInteger sentPackets = 0, drainedPackets = 0, sentBytes = 0;
+    __block uint64_t sentSamples = 0, drainedSamples = 0, sourceSamples = 0;
+    uint64_t generatedSamples = 0;
+    __block uint64_t sentRTPSamples = 0;
+    LiveQueue sendQueue = {0};
 #if ACOUPLET_LDAC_PROBE_ONLY
     uint64_t targetSamples = (uint64_t)seconds * profile.sampleRate;
     const BOOL continuous = seconds == 0;
@@ -1355,7 +1516,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     probe.pcmContinuous = continuous;
     probe.pcmReserveBytes = MIN(profile.capacityBytes, MAX(profile.prefillBytes, (probe.pcmBytes / PCMBlockBytes) * PCMBlockBytes));
     probe.pcmCanSkip = YES;
-    BOOL finishing = NO;
+    __block BOOL finishing = NO;
     probe.gain = gain;
     probe.targetGain = gain;
     probe.gainAckReady = YES;
@@ -1363,11 +1524,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
     unsigned int flushCalls = 0;
     float pcm[256];
     uint8_t packet[LDACBT_MAX_NBYTES + 13];
-    RecoveryState recovery = {0};
-    BOOL limitStopped = NO;
+    __block RecoveryState recovery = {0};
+    __block BOOL limitStopped = NO;
     double lastLatenessAt = 0;
     double started = 0;
-    double sourceResync = 0;
+    __block double sourceResync = 0;
     do {
         if (probe.closed || probe.failed || fd < 0) break;
         int socketType = 0;
@@ -1389,8 +1550,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
             event.flags & (EV_ERROR | EV_EOF) || event.data <= 0 || event.data > INT_MAX) break;
         double initialPollAt = MonotonicTime();
         int baseline = (int)event.data;
-        SocketBufferState socketBuffer = {.baseline = baseline};
-        if (setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &baseline, sizeof(baseline)) != 0) break;
+        __block SocketBufferState socketBuffer = {.baseline = baseline};
+        // Low water of 1 byte: EVFILT_WRITE reports the free space whenever there is any, so drain progress is
+        // visible packet by packet and not only when the socket is empty (L7).
+        int lowWater = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &lowWater, sizeof(lowWater)) != 0) break;
         lowWaterChanged = YES;
         printf("SOCKET fd=%d CID=%04X outgoingMTU=%u type=%d baseline=%d\n",
                fd, owned.cid, owned.outgoingMTU, socketType, baseline);
@@ -1399,18 +1563,181 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
         double paceStart = started;
         probe.degradation = NewDegradation(started, profile.sampleRate, probe.pcmSkippedBytes);
         double deadline = continuous ? INFINITY : started + seconds + 1;
-        double nextProgress = started + 1;
-        double lastPollAt = initialPollAt;
-        double maximumDrainSinceProgress = 0; // Longest send-to-drain wait since the last LIVE_PROGRESS line (L7).
-        int lastPollCount = 1;
-        unsigned int lastPollFlags = event.flags;
-        long lastPollData = (long)event.data;
+        __block double nextProgress = started + 1;
+        __block double lastPollAt = initialPollAt;
+        __block double maximumDrainSinceProgress = 0; // Longest drain wait since the last LIVE_PROGRESS line (L7).
+        __block int lastPollCount = 1;
+        __block unsigned int lastPollFlags = event.flags;
+        __block long lastPollData = (long)event.data;
         printf("LIVE_BEGIN gain=%.17g seconds=%u targetSamples=%llu bufferedFrames=%lu reserveFrames=%lu\n",
                gain, seconds, targetSamples, probe.pcmBytes / 8, probe.pcmReserveBytes / 8);
-        SenderTiming timing = NewSenderTiming();
+        __block SenderTiming timing = NewSenderTiming();
         probe.schedulerBaseline = TakeSchedulerSample();
         PrintSchedulerSample("LIVE_BEGIN", -1, probe.schedulerBaseline, probe.schedulerBaseline);
         BreachStreak breachStreaks[BreachKindCount] = {{0}};
+        BreachStreak *streaks = breachStreaks;
+        if (!LiveQueueInit(&sendQueue, baseline)) break;
+        LiveQueue *sendq = &sendQueue;
+        // Audio not yet drained from the socket may reach the PCM reserve (250 ms); beyond it the sender waits.
+        const uint64_t capSamples = continuous ? probe.pcmReserveBytes / 8 : 0;
+        __block double lastProgressAt = started;
+        __block double lastServiceAt = started;
+        __block BOOL drainBreached = NO;
+        __block double maximumSchedulerGap = 0;
+        __block long writable = 0;
+        __block NSUInteger statsRetained = 0, statsPeakPackets = 0;
+        __block uint64_t statsPeakSamples = 0, statsSkippedBase = probe.pcmSkippedBytes / 8;
+        __block double statsMaxDrain = 0, nextStats = started + 5;
+        // Writes queued packets while the socket has room, accounts for what has drained, and watches for a stall.
+        // Returns nonzero when the stream must stop (error, send failure or no drain progress for the hard limit).
+        int (^service)(void) = ^int(void) {
+            double pollAt = MonotonicTime();
+            maximumSchedulerGap = fmax(maximumSchedulerGap, pollAt - lastServiceAt);
+            double previousPollAt = lastPollAt;
+            int previousCount = lastPollCount;
+            unsigned int previousFlags = lastPollFlags;
+            long previousData = lastPollData;
+            double wakeGap = pollAt - lastPollAt;
+            struct kevent serviceEvent;
+            int count = kevent(queue, NULL, 0, &serviceEvent, 1, &immediate);
+            int pollError = count < 0 ? errno : 0;
+            double now = MonotonicTime();
+            lastServiceAt = now;
+            lastPollAt = now;
+            lastPollCount = count;
+            lastPollFlags = count > 0 ? serviceEvent.flags : 0;
+            lastPollData = count > 0 ? (long)serviceEvent.data : 0;
+            if (count < 0 || (count && serviceEvent.flags & (EV_ERROR | EV_EOF))) {
+                printf("DRAIN_ERROR packet=%lu count=%d flags=%04X data=%ld errno=%d\n",
+                       sentPackets ? sentPackets - 1 : 0, count, lastPollFlags, lastPollData, pollError);
+                return 1;
+            }
+            if (count) {
+                NoteSocketBuffer(&socketBuffer, serviceEvent.data, sentPackets);
+                writable = (long)serviceEvent.data;
+                if (LiveQueueObserve(sendq, writable)) {
+                    lastProgressAt = now;
+                    drainBreached = NO;
+                }
+            } else {
+                writable = 0;
+            }
+            LiveQueuePacket *done;
+            while ((done = LiveQueueNextDrained(sendq))) {
+                double drainDuration = now - done->sentAt;
+                maximumDrainSinceProgress = fmax(maximumDrainSinceProgress, drainDuration);
+                statsMaxDrain = fmax(statsMaxDrain, drainDuration);
+                if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f\n",
+                       drainedPackets, writable, baseline, now - started, drainDuration, lastPollFlags, wakeGap);
+                timing = NewSenderTiming();
+                probe.schedulerBaseline = TakeSchedulerSample();
+                drainedPackets++;
+                drainedSamples += done->samples;
+                if (drainedPackets == 1) printf("LIVE_SENT packets=1 rate=%u channels=2 bitrateKbps=%d eqmid=%d\n",
+                    profile.sampleRate, done->format.bitrateKbps, profile.eqmid);
+                else if (profile.adaptive && done->format.frameBytes != transmittedFormat.frameBytes)
+                    printf("LIVE_FORMAT rate=%u channels=2 bitrateKbps=%d frameBytes=%d\n",
+                           profile.sampleRate, done->format.bitrateKbps, done->format.frameBytes);
+                transmittedFormat = done->format;
+                if (done->gainAck) printf("GAIN_APPLIED gain=%.17g\n", probe.targetGain);
+                if (now >= nextProgress) {
+                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f maxDrain=%.4f\n",
+                           sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
+                           done->lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
+                           sentRTPSamples, sourceResync, maximumDrainSinceProgress);
+                    maximumDrainSinceProgress = 0;
+                    nextProgress = now + 1;
+                    FlushBreachStreaks(streaks, now, NO);
+                }
+                if (profile.adaptive && !finishing && !probe.stopRequested) {
+                    int priority = LDACAdaptivePolicyObserve(&adaptivePolicy, ldacBT_get_eqmid(probe.encoder),
+                        (double)done->samples / profile.sampleRate, now - done->enqueuedAt, maximumSchedulerGap,
+                        done->lateness, adaptiveSourceReady && adaptiveSkippedBytes == probe.pcmSkippedBytes);
+                    if (priority) {
+                        if (ldacBT_alter_eqmid_priority(probe.encoder, priority) != 0) {
+                            printf("ENCODER_FAILED reason=adaptive-quality code=%d\n", ldacBT_get_error_code(probe.encoder));
+                            probe.failed = YES;
+                        } else {
+                            printf("ADAPTIVE_TARGET packet=%lu priority=%d eqmid=%d writeAndDrain=%.6f schedulerGap=%.6f late=%.6f\n",
+                                   drainedPackets - 1, priority, ldacBT_get_eqmid(probe.encoder),
+                                   now - done->enqueuedAt, maximumSchedulerGap, done->lateness);
+                        }
+                    }
+                }
+                maximumSchedulerGap = 0;
+                adaptiveSourceReady = YES;
+                adaptiveSkippedBytes = probe.pcmSkippedBytes;
+                LiveQueuePopDrained(sendq);
+            }
+            // No drain progress while data is pending is the real stall: DRAIN_BREACH at 100 ms, the hard limit at
+            // about 1 s. A deep queue that keeps draining is neither.
+            BOOL pending = sendq->tail > sendq->head;
+            if (!pending) lastProgressAt = now;
+            double stalled = pending ? now - lastProgressAt : 0;
+            maximumDrainSinceProgress = fmax(maximumDrainSinceProgress, stalled);
+            statsMaxDrain = fmax(statsMaxDrain, stalled);
+            if (stalled >= 0.1 && !drainBreached) {
+                drainBreached = YES;
+                BOOL first = RecordBreach(&recovery, now);
+                SchedulerSample sample = TakeSchedulerSample();
+                if (NoteBreach(&streaks[BreachDrain], BreachKinds[BreachDrain], now, stalled,
+                               SchedulerWaiting(probe.schedulerBaseline, sample))) {
+                    printf("DRAIN_BREACH packet=%lu elapsed=%.6f duration=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d queuedPackets=%lu\n",
+                           sentPackets ? sentPackets - 1 : 0, now - started, stalled, first, previousPollAt - started, wakeGap,
+                           now - pollAt, previousCount, previousFlags, previousData, count,
+                           lastPollFlags, lastPollData, pollError, (unsigned long)(sendq->tail - sendq->send));
+                    PrintSchedulerSample("DRAIN_BREACH", sentPackets ? (long)sentPackets - 1 : 0, probe.schedulerBaseline, sample);
+                }
+            }
+            double drainLimit = continuous ? (double)profile.capacityBytes / (profile.sampleRate * 8) : 0.25;
+            if (pending && (stalled >= drainLimit || now >= deadline)) {
+                limitStopped = YES;
+                printf("DRAIN_LIMIT packet=%lu elapsed=%.6f duration=%.6f limit=%.3f lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f count=%d flags=%04X data=%ld\n",
+                       sentPackets ? sentPackets - 1 : 0, now - started, stalled, drainLimit, previousPollAt - started, wakeGap, now - pollAt,
+                       previousCount, previousFlags, previousData);
+                return 1;
+            }
+            LiveQueuePacket *next;
+            while ((next = LiveQueueNextToSend(sendq, writable))) {
+                double beforeSend = MonotonicTime();
+                ssize_t sent = send(fd, next->bytes, next->length, 0);
+                double afterSend = MonotonicTime();
+                int sendError = sent < 0 ? errno : 0;
+                if (sent < 0 && (sendError == EAGAIN || sendError == EWOULDBLOCK)) {
+                    writable = 0;
+                    break;
+                }
+                if (!continuous || sent != (ssize_t)next->length) printf("SEND packet=%lu CID=%04X bytes=%zd expected=%lu elapsed=%.6f duration=%.6f late=%.6f errno=%d\n",
+                       sentPackets, owned.cid, sent, next->length, afterSend - started, afterSend - beforeSend, next->lateness,
+                       sendError);
+                if (sent != (ssize_t)next->length) return 1;
+                writable -= sent;
+                next->sentAt = afterSend;
+                sentPackets++;
+                sentBytes += (NSUInteger)sent;
+                sentSamples += next->samples;
+                sentRTPSamples = next->rtpEnd;
+                LiveQueueMarkSent(sendq);
+            }
+            for (uint64_t index = sendq->send; index < sendq->tail; index++) {
+                LiveQueuePacket *held = LiveQueueAt(sendq, index);
+                if (!held->held) { held->held = YES; statsRetained++; }
+            }
+            if (sendq->tail - sendq->send > statsPeakPackets) statsPeakPackets = (NSUInteger)(sendq->tail - sendq->send);
+            if (sendq->unsentSamples > statsPeakSamples) statsPeakSamples = sendq->unsentSamples;
+            if (now >= nextStats) {
+                uint64_t skipped = probe.pcmSkippedBytes / 8 - statsSkippedBase;
+                if (statsRetained || skipped)
+                    printf("QUEUE_STATS retained=%lu peakPackets=%lu peakMs=%.1f skippedFrames=%llu maxDrain=%.4f capMs=%.1f\n",
+                           statsRetained, statsPeakPackets, 1000.0 * statsPeakSamples / profile.sampleRate, skipped, statsMaxDrain,
+                           1000.0 * capSamples / profile.sampleRate);
+                statsRetained = 0; statsPeakPackets = 0; statsPeakSamples = 0; statsMaxDrain = 0;
+                statsSkippedBase = probe.pcmSkippedBytes / 8;
+                nextStats = now + 5;
+            }
+            return 0;
+        };
+        BOOL serviceStopped = NO;
         while (YES) {
             RecordSenderStage(&timing, SenderControl);
             PollLiveControls(probe);
@@ -1486,7 +1813,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                         lastPollData = count > 0 ? (long)event.data : 0;
                         lastLatenessAt = now;
                         if (count > 0) NoteSocketBuffer(&socketBuffer, event.data, sentPackets);
-                        if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || !SocketDrained(event.data, baseline)))) {
+                        if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF)))) {
                             probe.failed = YES;
                             break;
                         }
@@ -1494,6 +1821,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                     RecordSenderStage(&timing, SenderPacing);
                     RunLoopFor(0.001);
                     RecordSenderStage(&timing, SenderOther);
+                    if (service()) { serviceStopped = YES; break; }
+                }
+                if (serviceStopped) {
+                    printf("DRAIN_STOP packet=%lu elapsed=%.6f\n", sentPackets ? sentPackets - 1 : 0, MonotonicTime() - started);
+                    break;
                 }
                 if (probe.stopRequested) continue;
                 if (probe.pcmBytes < requiredBytes || probe.closed || probe.failed || probe.inputEnded) {
@@ -1581,6 +1913,11 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 RecordSenderStage(&timing, SenderPacing);
                 RunLoopFor(0.001);
                 RecordSenderStage(&timing, SenderOther);
+                if (service()) { serviceStopped = YES; break; }
+            }
+            if (serviceStopped) {
+                printf("DRAIN_STOP packet=%lu elapsed=%.6f\n", sentPackets ? sentPackets - 1 : 0, MonotonicTime() - started);
+                break;
             }
             double now = MonotonicTime();
             double lateness = now - due;
@@ -1615,7 +1952,7 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 lastPollData = count > 0 ? (long)event.data : 0;
                 lateness = now - due;
                 if (count > 0) NoteSocketBuffer(&socketBuffer, event.data, sentPackets);
-                if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF) || !SocketDrained(event.data, baseline)))) break;
+                if (count < 0 || (count && (event.flags & (EV_ERROR | EV_EOF)))) break;
             }
             lastLatenessAt = now;
             if (!probe.pcmSkippedBytes && RecordRecovery(&recovery, now, lateness))
@@ -1628,124 +1965,46 @@ static BOOL FeedLive(DirectMediaProbe *probe, CBL2CAPChannel *owned, double gain
                 break;
             }
 #endif
-            double beforeSend = MonotonicTime();
-            ssize_t sent = send(fd, packet, packetLength, 0);
-            double afterSend = MonotonicTime();
-            if (!continuous || sent != (ssize_t)packetLength) printf("SEND packet=%lu CID=%04X bytes=%zd expected=%lu elapsed=%.6f duration=%.6f late=%.6f errno=%d\n",
-                   sentPackets, owned.cid, sent, packetLength, afterSend - started, afterSend - beforeSend, lateness,
-                   sent < 0 ? errno : 0);
-            if (sent != (ssize_t)packetLength) break;
-            sentPackets++;
-            sentBytes += (NSUInteger)sent;
-            sentSamples += packet[12] * profile.frameSamples;
-            sentRTPSamples = timestamp + packet[12] * profile.frameSamples;
-            BOOL drained = NO;
-            BOOL drainBreached = NO;
-            double lastDrainObservation = afterSend;
-            double maximumSchedulerGap = 0;
-            while (!probe.closed && !probe.failed && !probe.inputEnded && owned.socketFD == fd) {
-                if (continuous && !probe.stopRequested && !finishing && [probe checkDegradation]) break;
-                double pollAt = MonotonicTime();
-                maximumSchedulerGap = fmax(maximumSchedulerGap, pollAt - lastDrainObservation);
-                double previousPollAt = lastPollAt;
-                double wakeGap = pollAt - lastPollAt;
-                int count = kevent(queue, NULL, 0, &event, 1, &immediate);
-                int pollError = count < 0 ? errno : 0;
-                now = MonotonicTime();
-                lastDrainObservation = now;
-                double drainDuration = now - afterSend;
-                maximumDrainSinceProgress = fmax(maximumDrainSinceProgress, drainDuration);
-                if (drainDuration >= 0.1 && !drainBreached) {
-                    drainBreached = YES;
-                    BOOL first = RecordBreach(&recovery, now);
-                    SchedulerSample sample = TakeSchedulerSample();
-                    if (NoteBreach(&breachStreaks[BreachDrain], BreachKinds[BreachDrain], now, drainDuration,
-                                   SchedulerWaiting(probe.schedulerBaseline, sample))) {
-                        printf("DRAIN_BREACH packet=%lu elapsed=%.6f duration=%.6f first=%d strictPass=0 lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f previousCount=%d previousFlags=%04X previousData=%ld count=%d flags=%04X data=%ld errno=%d\n",
-                               sentPackets - 1, now - started, drainDuration, first, lastPollAt - started, pollAt - lastPollAt,
-                               now - pollAt, lastPollCount, lastPollFlags, lastPollData, count,
-                               count > 0 ? event.flags : 0, count > 0 ? (long)event.data : 0, pollError);
-                        PrintSchedulerSample("DRAIN_BREACH", (long)sentPackets - 1, probe.schedulerBaseline, sample);
-                    }
-                }
-                lastPollAt = now;
-                lastPollCount = count;
-                lastPollFlags = count > 0 ? event.flags : 0;
-                lastPollData = count > 0 ? (long)event.data : 0;
-                if (count < 0 || (count && event.flags & (EV_ERROR | EV_EOF))) {
-                    printf("DRAIN_ERROR packet=%lu count=%d flags=%04X data=%ld errno=%d\n",
-                           sentPackets - 1, count, lastPollFlags, lastPollData, pollError);
-                    break;
-                }
-                if (count) {
-                    if (!continuous) printf("DRAIN packet=%lu writable=%ld baseline=%d elapsed=%.6f duration=%.6f flags=%04X wakeGap=%.6f\n",
-                           sentPackets - 1, (long)event.data, baseline, now - started, drainDuration, event.flags,
-                           wakeGap);
-                    NoteSocketBuffer(&socketBuffer, event.data, sentPackets - 1);
-                    if (SocketDrained(event.data, baseline)) drained = YES;
-                }
-                double drainLimit = continuous ? (double)profile.capacityBytes / (profile.sampleRate * 8) : 0.25;
-                if (drainDuration >= drainLimit || now >= deadline) {
-                    limitStopped = YES;
-                    printf("DRAIN_LIMIT packet=%lu elapsed=%.6f duration=%.6f limit=%.3f lastPoll=%.6f wakeGap=%.6f pollDuration=%.6f count=%d flags=%04X data=%ld\n",
-                           sentPackets - 1, now - started, drainDuration, drainLimit, previousPollAt - started, wakeGap, now - pollAt,
-                           lastPollCount, lastPollFlags, lastPollData);
-                    break;
-                }
-                if (count) break;
+            // Hand the packet to the queue and write it at once if the socket has room (L7). The sender waits
+            // only while the audio not yet drained is above the cap; below it the next packet is encoded on schedule.
+            LiveQueuePacket *slot = LiveQueueSlot(&sendQueue);
+            memcpy(slot->bytes, packet, packetLength);
+            slot->length = packetLength;
+            slot->samples = packetSamples;
+            slot->rtpEnd = timestamp + packetSamples;
+            slot->format = packetFormat;
+            slot->enqueuedAt = MonotonicTime();
+            slot->sentAt = 0;
+            slot->sentEnd = 0;
+            slot->lateness = lateness;
+            slot->held = NO;
+            slot->gainAck = probe.gainAckReady;
+            probe.gainAckReady = NO;
+            if (sendQueue.tail == sendQueue.head) lastProgressAt = slot->enqueuedAt;
+            LiveQueueCommit(&sendQueue);
+            BOOL stopSending = service() != 0;
+            while (!stopSending && LiveQueueFull(&sendQueue, capSamples)) {
+                if (probe.closed || probe.failed || probe.inputEnded || owned.socketFD != fd) { stopSending = YES; break; }
+                if (continuous && !probe.stopRequested && !finishing && [probe checkDegradation]) { stopSending = YES; break; }
                 PollLiveControls(probe);
                 [probe pollInput];
                 [probe pollPCM];
                 RunLoopFor(0.001);
+                stopSending = service() != 0;
             }
-            if (drained) {
-                timing = NewSenderTiming();
-                probe.schedulerBaseline = TakeSchedulerSample();
-                drainedPackets++;
-                drainedSamples = sentSamples;
-                if (drainedPackets == 1) printf("LIVE_SENT packets=1 rate=%u channels=2 bitrateKbps=%d eqmid=%d\n",
-                    profile.sampleRate, packetFormat.bitrateKbps, profile.eqmid);
-                else if (profile.adaptive && packetFormat.frameBytes != transmittedFormat.frameBytes)
-                    printf("LIVE_FORMAT rate=%u channels=2 bitrateKbps=%d frameBytes=%d\n",
-                           profile.sampleRate, packetFormat.bitrateKbps, packetFormat.frameBytes);
-                transmittedFormat = packetFormat;
-                if (probe.gainAckReady) {
-                    printf("GAIN_APPLIED gain=%.17g\n", probe.targetGain);
-                    probe.gainAckReady = NO;
-                }
-                if (now >= nextProgress) {
-                    printf("LIVE_PROGRESS sentPackets=%lu drainedPackets=%lu sourceSamples=%llu sentSamples=%llu drainedSamples=%llu bufferedFrames=%lu late=%.6f elapsed=%.6f strictPass=%d skippedFrames=%llu rtpSamples=%llu sourceResync=%.6f maxDrain=%.4f\n",
-                           sentPackets, drainedPackets, sourceSamples, sentSamples, drainedSamples, probe.pcmBytes / 8,
-                           lateness, now - started, !recovery.breached && !probe.pcmSkippedBytes, probe.pcmSkippedBytes / 8,
-                           sentRTPSamples, sourceResync, maximumDrainSinceProgress);
-                    maximumDrainSinceProgress = 0;
-                    nextProgress = now + 1;
-                    FlushBreachStreaks(breachStreaks, now, NO);
-                }
-                if (profile.adaptive && !finishing && !probe.stopRequested) {
-                    int priority = LDACAdaptivePolicyObserve(&adaptivePolicy, ldacBT_get_eqmid(probe.encoder),
-                        (double)packetSamples / profile.sampleRate, now - beforeSend, maximumSchedulerGap,
-                        lateness, adaptiveSourceReady && adaptiveSkippedBytes == probe.pcmSkippedBytes);
-                    if (priority) {
-                        if (ldacBT_alter_eqmid_priority(probe.encoder, priority) != 0) {
-                            printf("ENCODER_FAILED reason=adaptive-quality code=%d\n", ldacBT_get_error_code(probe.encoder));
-                            probe.failed = YES;
-                        } else {
-                            printf("ADAPTIVE_TARGET packet=%lu priority=%d eqmid=%d writeAndDrain=%.6f schedulerGap=%.6f late=%.6f\n",
-                                   sentPackets - 1, priority, ldacBT_get_eqmid(probe.encoder),
-                                   now - beforeSend, maximumSchedulerGap, lateness);
-                        }
-                    }
-                }
-                adaptiveSourceReady = YES;
-                adaptiveSkippedBytes = probe.pcmSkippedBytes;
-            }
-            if (!drained || limitStopped) { printf("DRAIN_STOP packet=%lu elapsed=%.6f\n", sentPackets - 1, MonotonicTime() - started); break; }
+            if (stopSending) { printf("DRAIN_STOP packet=%lu elapsed=%.6f\n", sentPackets ? sentPackets - 1 : 0, MonotonicTime() - started); break; }
+        }
+        // After a clean flush, wait for the queue and the socket to empty before judging the stream complete.
+        while (flushed && !probe.closed && !probe.failed && !probe.inputEnded && !limitStopped && !serviceStopped &&
+               owned.socketFD == fd && sendQueue.head < sendQueue.tail) {
+            if (service()) break;
+            RunLoopFor(0.001);
         }
         FlushBreachStreaks(breachStreaks, MonotonicTime(), YES);
         if (!probe.closed && !probe.failed && !probe.inputEnded && !limitStopped && flushed && sourceSamples == targetSamples && generatedSamples == sentSamples && drainedPackets == sentPackets)
             result = 0;
     } while (NO);
+    LiveQueueFree(&sendQueue);
     probe.pcmComplete = YES;
     if (started) {
         double postroll = fmin(continuous ? INFINITY : started + seconds + 1, MonotonicTime() + 0.5);
