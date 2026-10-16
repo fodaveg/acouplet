@@ -647,10 +647,11 @@ struct MenuBarView: View {
                     get: { headphones.equalizer.presetID },
                     set: { if let preset = $0 { headphones.setEqualizerPreset(preset) } }
                 )) {
-                    if !equalizerPresets.contains(where: { $0.id == headphones.equalizer.presetID }) {
+                    if let current = headphones.equalizer.presetID, !equalizerPresets.contains(where: { $0.id == current }) {
                         Text(headphones.equalizer.presetTitle ?? String(localized: "Loading…"))
-                            .tag(headphones.equalizer.presetID).disabled(true)
+                            .tag(Optional(current)).disabled(true)
                     }
+                    unsetSelectionRow(String(localized: "Loading…"), for: headphones.equalizer.presetID)
                     ForEach(equalizerPresets) { preset in
                         Text(preset.title).tag(Optional(preset.id))
                     }
@@ -834,6 +835,17 @@ struct LDACPermissionGuidance: View {
 }
 #endif
 
+/// Row for the `nil` selection of a Picker with an optional binding.
+///
+/// It is always present, tagged with the exact `Optional<Value>.none` and never disabled: while the state is being
+/// reset the selection is briefly nil, and SwiftUI logs `Picker: the selection "nil" is invalid` if no enabled row
+/// carries that tag in that frame (G6). The binding's `set` must keep ignoring nil so nothing is written to the headphones.
+/// `current` only fixes the tag type; its value is not used.
+@ViewBuilder
+func unsetSelectionRow<Value: Hashable>(_ title: String, for current: Value?) -> some View {
+    Text(title).tag(Optional<Value>.none)
+}
+
 struct ConnectedHeadphonePicker: View {
     var showsIconOnly = false
     @EnvironmentObject private var devices: SonyDeviceCoordinator
@@ -868,14 +880,10 @@ struct ConnectedHeadphonePicker: View {
             get: { devices.selectedAddress },
             set: { if let address = $0 { devices.select(address: address) } }
         )) {
-            if let address = devices.selectedAddress {
-                if !devices.selectableDevices.contains(where: { $0.address == address }) {
-                    Text(devices.selectedController.deviceName).tag(Optional(address)).disabled(true)
-                }
-            } else {
-                // Sin dispositivo seleccionado (por ejemplo, mientras se reinicia el estado) la selección es nil.
-                Text(devices.selectedController.deviceName).tag(String?.none).disabled(true)
+            if let address = devices.selectedAddress, !devices.selectableDevices.contains(where: { $0.address == address }) {
+                Text(devices.selectedController.deviceName).tag(Optional(address)).disabled(true)
             }
+            unsetSelectionRow(devices.selectedController.deviceName, for: devices.selectedAddress)
             ForEach(devices.connectedDevices) { device in
                 Text(Self.title(for: device, among: devices.selectableDevices))
                     .tag(Optional(device.address))

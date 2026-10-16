@@ -1122,7 +1122,7 @@ private struct VoiceGuidanceControls: View {
                             get: { state.volume },
                             set: { if let volume = $0 { headphones.setVoiceGuidanceVolume(volume) } }
                         )) {
-                            if state.volume == nil { Text("Unknown").tag(Int?.none).disabled(true) }
+                            unsetSelectionRow(String(localized: "Unknown"), for: state.volume)
                             ForEach(SonyVoiceGuidance.volumeRange, id: \.self) { volume in
                                 Text([String(localized: "Very low"), String(localized: "Low"), String(localized: "Medium"), String(localized: "High"), String(localized: "Very high")][volume + 2])
                                     .tag(Optional(volume))
@@ -1330,10 +1330,10 @@ private struct TouchAssignmentControl: View {
             get: { selected },
             set: { if let preset = $0 { headphones.setTouchAssignment(key: key.key, preset: preset) } }
         )) {
-            if !key.presets.contains(where: { $0.preset == selected }) {
-                Text(selected == nil ? String(localized: "Not reported") : String(localized: "Unsupported assignment"))
-                    .tag(selected).disabled(true)
+            if let selected, !key.presets.contains(where: { $0.preset == selected }) {
+                Text(String(localized: "Unsupported assignment")).tag(Optional(selected)).disabled(true)
             }
+            unsetSelectionRow(String(localized: "Not reported"), for: selected)
             ForEach(key.presets, id: \.preset) { preset in
                 Text(preset.title(generation: state.generation)).tag(Optional(preset.preset))
                     .disabled(state.setPayload(key: key.key, preset: preset.preset) == nil)
@@ -1371,10 +1371,10 @@ private struct ConnectionModeControl: View {
                         }
                     }
                 )) {
-                    if headphones.connectionMode?.sonyValue == nil {
-                        Text(headphones.connectionMode == nil ? String(localized: "Loading…") : String(localized: "Unknown"))
-                            .tag(headphones.connectionMode)
+                    if let current = headphones.connectionMode, current.sonyValue == nil {
+                        Text("Unknown").tag(Optional(current))
                     }
+                    unsetSelectionRow(String(localized: "Loading…"), for: headphones.connectionMode)
                     ForEach(modes, id: \.self) { mode in
                         Text(mode.title).tag(Optional(mode))
                             .disabled(headphones.connectionModeUnavailableReason(mode) != nil)
@@ -1558,10 +1558,11 @@ struct LegacySoundEffectControl: View {
                     get: { effect.presetID },
                     set: { if let preset = $0 { headphones.setLegacySoundEffect(kind, preset: preset) } }
                 )) {
-                    if !effect.selectablePresets.contains(where: { $0.id == effect.presetID }) {
-                        Text(effect.selectedTitle ?? (headphones.settingErrors[setting] == nil ? String(localized: "Loading…") : String(localized: "Unknown")))
-                            .tag(effect.presetID).disabled(true)
+                    let unavailableTitle = effect.selectedTitle ?? (headphones.settingErrors[setting] == nil ? String(localized: "Loading…") : String(localized: "Unknown"))
+                    if let current = effect.presetID, !effect.selectablePresets.contains(where: { $0.id == current }) {
+                        Text(unavailableTitle).tag(Optional(current)).disabled(true)
                     }
+                    unsetSelectionRow(unavailableTitle, for: effect.presetID)
                     ForEach(effect.selectablePresets) { preset in
                         Text(preset.name).tag(Optional(preset.id))
                     }
@@ -1598,10 +1599,10 @@ struct DSEEControl: View {
                     get: { headphones.dseeMode },
                     set: { if let mode = $0 { headphones.setDSEE(mode) } }
                 )) {
-                    if headphones.dseeMode?.sonyValue == nil {
-                        Text(headphones.dseeMode == nil && headphones.settingErrors[.dsee] == nil ? String(localized: "Loading…") : String(localized: "Unknown"))
-                            .tag(headphones.dseeMode)
+                    if let current = headphones.dseeMode, current.sonyValue == nil {
+                        Text("Unknown").tag(Optional(current))
                     }
+                    unsetSelectionRow(headphones.settingErrors[.dsee] == nil ? String(localized: "Loading…") : String(localized: "Unknown"), for: headphones.dseeMode)
                     ForEach(SonyDSEEMode.allCases) { mode in
                         Text(mode.title).tag(Optional(mode))
                     }
@@ -1676,9 +1677,10 @@ private struct SpeakToChatOptionsControl: View {
                         headphones.setSpeakToChatOptions(sensitivity: sensitivity, delay: delay)
                     } }
                 )) {
-                    if options.sensitivity?.sonyValue == nil {
-                        Text("Unknown").tag(options.sensitivity).disabled(true)
+                    if let current = options.sensitivity, current.sonyValue == nil {
+                        Text("Unknown").tag(Optional(current)).disabled(true)
                     }
+                    unsetSelectionRow(String(localized: "Unknown"), for: options.sensitivity)
                     ForEach(SonySpeechSensitivity.options, id: \.self) { sensitivity in
                         Text(sensitivity.title).tag(Optional(sensitivity))
                     }
@@ -1698,9 +1700,10 @@ private struct SpeakToChatOptionsControl: View {
                         headphones.setSpeakToChatOptions(sensitivity: sensitivity, delay: delay)
                     } }
                 )) {
-                    if options.delay?.sonyValue == nil {
-                        Text("Unknown").tag(options.delay).disabled(true)
+                    if let current = options.delay, current.sonyValue == nil {
+                        Text("Unknown").tag(Optional(current)).disabled(true)
                     }
+                    unsetSelectionRow(String(localized: "Unknown"), for: options.delay)
                     ForEach(SonySpeakToChatDelay.options, id: \.self) { delay in
                         Text(delay.title).tag(Optional(delay))
                     }
@@ -1730,10 +1733,10 @@ private struct VoiceAssistantControl: View {
                         get: { state.knownCurrent },
                         set: { if let option = $0 { headphones.setVoiceAssistant(option) } }
                     )) {
-                        if !options.contains(where: { $0 == state.knownCurrent }) {
-                            Text(state.knownCurrent?.title ?? String(localized: "Unknown")).tag(state.knownCurrent)
-                                .disabled(true)
+                        if let current = state.knownCurrent, !options.contains(current) {
+                            Text(current.title).tag(Optional(current)).disabled(true)
                         }
+                        unsetSelectionRow(String(localized: "Unknown"), for: state.knownCurrent)
                         ForEach(options, id: \.self) { option in
                             Text(option.title).tag(Optional(option))
                                 .disabled(state.setPayload(option) == nil)
@@ -1777,10 +1780,10 @@ private struct AutomaticPowerOffControl: View {
                         get: { state.knownCurrent },
                         set: { if let option = $0 { headphones.setAutomaticPowerOff(option) } }
                     )) {
-                        if !options.contains(where: { $0 == state.knownCurrent }) {
-                            Text(state.knownCurrent?.title ?? String(localized: "Unknown")).tag(state.knownCurrent)
-                                .disabled(true)
+                        if let current = state.knownCurrent, !options.contains(current) {
+                            Text(current.title).tag(Optional(current)).disabled(true)
                         }
+                        unsetSelectionRow(String(localized: "Unknown"), for: state.knownCurrent)
                         ForEach(options, id: \.self) { option in
                             Text(option.title).tag(Optional(option))
                                 .disabled(state.setPayload(option) == nil)
