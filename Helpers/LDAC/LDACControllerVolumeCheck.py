@@ -811,7 +811,7 @@ names = ["needsStopBeforeTermination", "deviceUnavailableReason", "refreshDriver
          "hasOtherMusicSource", "bindingIsCurrent", "bindingCheck", "musicControlStatus", "waitForControls", "controlsChanged",
          "holdBinding", "recoverBinding", "stopForChange", "sendPendingVolume", "setOutputGain", "fail", "beginRecovery",
          "scheduleRecovery", "endRetryWait", "cancelAutomaticRetry", "stop", "stopSession",
-         "suspend", "resumeIfReady", "reconcileConnectionPreferences", "forgetConnectionPreference", "scheduleConnectionPreferenceRestoration", "prepareConnectionMode", "waitForConnectionChange", "restoreConnectionMode",
+         "suspend", "resumeIfReady", "recordRetryBlocked", "reconcileConnectionPreferences", "forgetConnectionPreference", "scheduleConnectionPreferenceRestoration", "prepareConnectionMode", "waitForConnectionChange", "restoreConnectionMode",
          "restoreConnectionPreference", "finish", "completeStop"]
 fixture = fixture.replace("precondition(", "check(")
 fixture = fixture.replace("__VOLUME__", volume).replace("__METHODS__", "\n".join(member(name) for name in names))
