@@ -140,11 +140,85 @@ final class SonyEqualizerTests: XCTestCase {
         XCTAssertNil(ult.settingsPayload(.flat))
     }
 
+    func testUserSlotCurvesWriteRawValuesForTheSelectedSlotOnly() throws {
+        var equalizer = prepared(presets: [0, 0xA0, 0xA1, 0xA2])
+        XCTAssertEqual(equalizer.savableSlots, [0xA1, 0xA2])
+        var curve = try XCTUnwrap(equalizer.flatSettings)
+        curve.values = [-10, -5, 0, 3, 7, 10]
+        let raw: [UInt8] = [0, 5, 10, 13, 17, 20]
+        XCTAssertEqual(equalizer.curvePayload(curve, target: 0xA1), [0x58, 0, 0xA1, 6] + raw)
+        XCTAssertEqual(equalizer.curvePayload(curve, target: 0xA2), [0x58, 0, 0xA2, 6] + raw)
+        XCTAssertEqual(equalizer.curvePayload(curve, target: 0xA0), [0x58, 0, 0xA0, 6] + raw)
+        XCTAssertNil(equalizer.curvePayload(curve, target: 0xA3))
+        XCTAssertNil(equalizer.curvePayload(curve, target: 0x10))
+        XCTAssertEqual(equalizer.presetPayload(0xA1), [0x58, 0, 0xA1, 0])
+        // The slot has to be the active preset when the frame goes out.
+        let toUser1 = try XCTUnwrap(equalizer.curvePayload(curve, target: 0xA1))
+        XCTAssertFalse(equalizer.acceptsSetPayload(toUser1))
+        XCTAssertTrue(equalizer.update([0x59, 0, 0xA1, 0]))
+        XCTAssertTrue(equalizer.acceptsSetPayload(toUser1))
+        XCTAssertFalse(equalizer.acceptsSetPayload([0x58, 0, 0xA2, 6] + raw))
+        XCTAssertFalse(equalizer.acceptsSetPayload([0x58, 0, 0xA0, 6] + raw))
+        // The confirmation is the whole curve in that slot, never the bare selection.
+        XCTAssertEqual(equalizer.confirmationValue(toUser1), [0xA1, 6] + raw)
+        XCTAssertEqual(equalizer.confirmationValue([0x57, 0, 0xA1, 6] + raw), [0xA1, 6] + raw)
+        XCTAssertEqual(equalizer.confirmationValue([0x58, 0, 0xA1, 0]), [0xA1])
+        // The re-read `57 00 Ax n ...` is parsed as that slot's curve.
+        XCTAssertTrue(equalizer.update([0x57, 0, 0xA1, 6] + raw))
+        XCTAssertEqual(equalizer.presetID, 0xA1)
+        XCTAssertEqual(equalizer.settings, curve)
+        XCTAssertTrue(equalizer.update([0x57, 0, 0xA2, 6] + raw.reversed()))
+        XCTAssertEqual(equalizer.presetID, 0xA2)
+        XCTAssertNotEqual(equalizer.settings, curve)
+        // Slots that are not advertised are not offered.
+        XCTAssertEqual(prepared(presets: [0, 0xA0, 0xA2]).savableSlots, [0xA2])
+        XCTAssertEqual(prepared().savableSlots, [])
+    }
+
+    func testThirteenStepSlotsCenterOnSix() throws {
+        var equalizer = prepared(layout: SonyEqualizerBand.tenBand, steps: 13, presets: [0, 0xA0, 0xA1, 0xA2])
+        var curve = try XCTUnwrap(equalizer.flatSettings)
+        curve.values = [-6, -5, -4, -3, 0, 1, 2, 3, 5, 6]
+        let raw: [UInt8] = [0, 1, 2, 3, 6, 7, 8, 9, 11, 12]
+        XCTAssertEqual(equalizer.curvePayload(curve, target: 0xA2), [0x58, 0, 0xA2, 10] + raw)
+        curve.values[0] = -7
+        XCTAssertNil(equalizer.curvePayload(curve, target: 0xA2))
+        XCTAssertTrue(equalizer.update([0x57, 0, 0xA2, 10] + raw))
+        XCTAssertEqual(equalizer.settings?.values, [-6, -5, -4, -3, 0, 1, 2, 3, 5, 6])
+    }
+
+    func testLegacySlotsSelectFirstThenWriteToFFAndReadTheSlotBack() throws {
+        var equalizer = SonyEqualizer(supportedFunctions: [0x51], generation: .v1)
+        let presets: [UInt8] = [0, 0x16, 0xA0, 0xA1, 0xA2]
+        XCTAssertTrue(equalizer.update([0x51, 1, 6, 21, UInt8(presets.count)] + presets.flatMap { [$0, 0] }))
+        XCTAssertTrue(equalizer.update([0x53, 1, 0]))
+        let bands: [UInt8] = SonyEqualizerBand.legacy.flatMap { [$0.informationType, UInt8($0.value >> 8), UInt8($0.value & 0xFF)] }
+        XCTAssertTrue(equalizer.update([0x5B, 1, 6] + bands))
+        XCTAssertTrue(equalizer.update([0x57, 1, 0x16, 0]))
+        XCTAssertEqual(equalizer.savableSlots, [0xA1, 0xA2])
+        var curve = try XCTUnwrap(equalizer.flatSettings)
+        curve.values = [-10, -5, 0, 3, 7, 10]
+        let raw: [UInt8] = [0, 5, 10, 13, 17, 20]
+        let write = try XCTUnwrap(equalizer.curvePayload(curve, target: 0xA1))
+        XCTAssertEqual(write, [0x58, 1, 0xFF, 6] + raw)
+        XCTAssertEqual(equalizer.curvePayload(curve, target: 0xA2), write)
+        XCTAssertFalse(equalizer.acceptsSetPayload(write))
+        XCTAssertEqual(equalizer.presetPayload(0xA1), [0x58, 1, 0xA1, 0])
+        XCTAssertTrue(equalizer.update([0x59, 1, 0xA1, 0]))
+        XCTAssertTrue(equalizer.acceptsSetPayload(write))
+        XCTAssertEqual(equalizer.confirmationValue(write), [0xA1, 6] + raw)
+        XCTAssertTrue(equalizer.update([0x57, 1, 0xA1, 6] + raw))
+        XCTAssertEqual(equalizer.settings, curve)
+        XCTAssertEqual(equalizer.confirmationValue([0x57, 1, 0xA1, 6] + raw), [0xA1, 6] + raw)
+        // A different slot's readback does not confirm the write.
+        XCTAssertNotEqual(equalizer.confirmationValue([0x57, 1, 0xA2, 6] + raw), [0xA1, 6] + raw)
+    }
+
     private func prepared(layout: [SonyEqualizerBand] = SonyEqualizerBand.legacy, steps: UInt8 = 21,
-                          type: UInt8 = 0) -> SonyEqualizer {
+                          type: UInt8 = 0, presets: [UInt8] = [0, 0xA0]) -> SonyEqualizer {
         let function: UInt8 = type == 4 ? 0x57 : type == 2 ? 0x52 : 0x50
         var equalizer = SonyEqualizer(supportedFunctions: [function])
-        XCTAssertTrue(equalizer.update([0x51, type, UInt8(layout.count), steps, 2, 0, 0, 0xA0, 0]))
+        XCTAssertTrue(equalizer.update([0x51, type, UInt8(layout.count), steps, UInt8(presets.count)] + presets.flatMap { [$0, 0] }))
         let metadata: [UInt8] = layout.flatMap { [$0.informationType, UInt8($0.value >> 8), UInt8($0.value & 0xFF)] }
         XCTAssertTrue(equalizer.update([0x5B, type, UInt8(layout.count)] + metadata))
         XCTAssertTrue(equalizer.update(type == 4 ? [0x53, type, 0, 0] : [0x53, type, 0]))

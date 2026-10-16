@@ -815,6 +815,8 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     private var multipointConnection: MultipointConnection?
     private var multipointRecoveryAttempts = 0
     private var unconfirmedEqualizerRequestID: UUID?
+    /// Curve waiting for its destination preset (Manual or a user slot) to be selected and confirmed.
+    private var equalizerCurveFollowUp: (target: UInt8, settings: EqualizerSettings)?
     private var acknowledgmentTimeout: DispatchWorkItem?
     private var transmissionID: UUID?
     private var commandQueue = SonyCommandQueue() {
@@ -3621,6 +3623,15 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     func performConfirmedEqualizerChange(_ settings: EqualizerSettings) async throws {
+        guard equalizer.settingsPayload(settings) != nil else {
+            throw HeadphoneControlError(message: String(localized: "The equalizer layout changed. Reopen the equalizer and try again."))
+        }
+        let manual = EqualizerPreset.manual.rawValue
+        if equalizer.presetID != manual, let select = equalizer.presetPayload(manual) {
+            try await performConfirmedSettingChange(.equalizer) {
+                queueEqualizer(select, debounce: false)
+            }
+        }
         guard let payload = equalizer.settingsPayload(settings) else {
             throw HeadphoneControlError(message: String(localized: "The equalizer layout changed. Reopen the equalizer and try again."))
         }
@@ -4245,7 +4256,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
                         if setting == .equalizerReadback {
                             return
                         } else if setting == .equalizer, self.equalizer.generation == .v1, payload[2] == 0xFF {
-                            self.dispatch([0x59, payload[1], EqualizerPreset.manual.rawValue] + payload.dropFirst(3), type: frame.type)
+                            self.dispatch([0x59, payload[1], self.equalizer.presetID ?? EqualizerPreset.manual.rawValue] + payload.dropFirst(3), type: frame.type)
                         } else if setting == .batteryCare {
                             self.dispatch([0x29, payload[1], payload[2]], type: frame.type)
                         } else if setting == .touchCustomActions {
@@ -4281,7 +4292,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self, self.controlSession == session, self.settingRequests[setting] == requestID else { return }
                 self.unconfirmedChanges[setting] = self.pendingChanges[setting]
-                if setting == .equalizer { self.unconfirmedEqualizerRequestID = requestID }
+                if setting == .equalizer { self.unconfirmedEqualizerRequestID = requestID; self.equalizerCurveFollowUp = nil }
                 self.pendingChanges[setting] = nil
                 self.settingRequests[setting] = nil
                 self.settingErrors[setting] = setting == .equalizerReadback
@@ -4321,6 +4332,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         settingRefreshes.removeValue(forKey: setting)?.cancel()
         finishSettingIntent(setting, requestID: requestID)
         if setting == .equalizer || setting == .equalizerReadback { sendRequestedEqualizer() }
+        if setting == .equalizer { continueEqualizerCurveFollowUp() }
         if setting == .noiseControl {
             isApplyingChange = false
             commandTimeoutWorkItem?.cancel()
@@ -4337,6 +4349,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         equalizerWorkItem = nil
         equalizerDebounceID = nil
         requestedEqualizerPayload = nil
+        equalizerCurveFollowUp = nil
         equalizerReadTimeout?.cancel()
         equalizerReadTimeout = nil
         equalizerRead = nil
@@ -4373,16 +4386,58 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
     }
 
     func setCustomEqualizer(_ settings: EqualizerSettings) {
-        guard let payload = equalizer.settingsPayload(settings) else {
+        queueEqualizerCurve(settings, target: EqualizerPreset.manual.rawValue, debounce: true)
+    }
+
+    /// Stores `settings` in a user slot (User 1 / User 2). Only slots the headphones advertise are accepted.
+    func saveEqualizerCurve(_ settings: EqualizerSettings, toSlot slot: UInt8) {
+        guard equalizer.savableSlots.contains(slot) else { return }
+        queueEqualizerCurve(settings, target: slot, debounce: false)
+    }
+
+    /// Writes a curve to `target`. The destination is selected and confirmed first when it is not
+    /// the active preset, because the headphones store a curve in whatever preset is active.
+    private func queueEqualizerCurve(_ settings: EqualizerSettings, target: UInt8, debounce: Bool) {
+        guard let payload = equalizer.curvePayload(settings, target: target) else {
             if isReady { settingErrors[.equalizer] = String(localized: "This equalizer layout is not available on the headphones.") }
             return
         }
-        queueEqualizer(payload, debounce: true)
+        if equalizer.presetID == target {
+            equalizerCurveFollowUp = nil
+            queueEqualizer(payload, debounce: debounce)
+            return
+        }
+        if equalizerCurveFollowUp?.target == target {
+            equalizerCurveFollowUp?.settings = settings
+            return
+        }
+        guard let select = equalizer.presetPayload(target) else {
+            if isReady { settingErrors[.equalizer] = String(localized: "This equalizer layout is not available on the headphones.") }
+            return
+        }
+        equalizerCurveFollowUp = nil
+        if queueEqualizer(select, debounce: false) { equalizerCurveFollowUp = (target, settings) }
     }
 
-    private func queueEqualizer(_ payload: [UInt8], debounce: Bool) {
-        guard powerOffState == nil, !isRunningHeadphoneTest, multipointTransition?.isFinished != false, deviceActionTransition?.isFinished != false else { return }
-        guard stage == .ready, connectionTransition?.isFinished != false else { return }
+    /// Runs after an equalizer change is confirmed: sends the waiting curve once its destination is active.
+    private func continueEqualizerCurveFollowUp() {
+        guard let followUp = equalizerCurveFollowUp else { return }
+        if equalizer.presetID == followUp.target {
+            equalizerCurveFollowUp = nil
+            guard let payload = equalizer.curvePayload(followUp.settings, target: followUp.target) else {
+                settingErrors[.equalizer] = String(localized: "Equalizer settings changed before the request could be sent.")
+                return
+            }
+            queueEqualizer(payload, debounce: false)
+        } else if requestedEqualizerPayload != equalizer.presetPayload(followUp.target) {
+            equalizerCurveFollowUp = nil
+        }
+    }
+
+    @discardableResult
+    private func queueEqualizer(_ payload: [UInt8], debounce: Bool) -> Bool {
+        guard powerOffState == nil, !isRunningHeadphoneTest, multipointTransition?.isFinished != false, deviceActionTransition?.isFinished != false else { return false }
+        guard stage == .ready, connectionTransition?.isFinished != false else { return false }
         equalizerWorkItem?.cancel()
         equalizerWorkItem = nil
         equalizerDebounceID = nil
@@ -4390,7 +4445,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         settingErrors[.equalizer] = nil
         guard debounce else {
             sendRequestedEqualizer()
-            return
+            return true
         }
         let session = controlSession
         let request = UUID()
@@ -4404,6 +4459,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
         }
         equalizerWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        return true
     }
 
     private func sendRequestedEqualizer() {
@@ -4413,6 +4469,7 @@ final class SonyHeadphonesController: NSObject, ObservableObject {
               pendingChanges[.equalizerReadback] == nil, let payload = requestedEqualizerPayload else { return }
         requestedEqualizerPayload = nil
         guard equalizer.acceptsSetPayload(payload) else {
+            equalizerCurveFollowUp = nil
             settingErrors[.equalizer] = String(localized: "Equalizer settings changed before the request could be sent.")
             return
         }

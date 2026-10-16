@@ -1516,6 +1516,39 @@ final class SonyLegacyControllerTests: XCTestCase {
         XCTAssertNil(controller.equalizer.settings)
     }
 
+    func testLegacySlotSaveSelectsTheSlotThenWritesToFFAndConfirmsByRereading() {
+        let controller = makeController(supportsEqualizer: true)
+        defer { controller.simulateControlLoss() }
+        deliver([0x51, 1, 6, 21, 4, 0x16, 0, 0xA0, 0, 0xA1, 0, 0xA2, 0], to: controller)
+        deliver([0x53, 1, 0], to: controller)
+        let metadata: [UInt8] = SonyEqualizerBand.legacy.flatMap { [$0.informationType, UInt8($0.value >> 8), UInt8($0.value & 0xFF)] }
+        deliver([0x5B, 1, 6] + metadata, to: controller)
+        deliver([0x57, 1, 0x16, 0], to: controller)
+        acknowledgeAll(controller)
+        XCTAssertEqual(controller.equalizer.savableSlots, [0xA1, 0xA2])
+        var curve = controller.equalizer.flatSettings!
+        curve.values = [-10, -5, 0, 3, 7, 10]
+        let raw: [UInt8] = [0, 5, 10, 13, 17, 20]
+        controller.saveEqualizerCurve(curve, toSlot: 0xA2)
+        XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x58, 1, 0xA2, 0])
+        acknowledgeAll(controller)
+        deliver([0x59, 1, 0xA2, 0], to: controller)
+        XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x58, 1, 0xFF, 6] + raw)
+        acknowledgeAll(controller)
+        controller.refreshEqualizer()
+        acknowledgeAll(controller)
+        // Another slot's curve does not confirm it; the slot just written does.
+        deliver([0x57, 1, 0xA1, 6] + raw, to: controller)
+        XCTAssertNotNil(controller.pendingChanges[.equalizer])
+        controller.refreshEqualizer()
+        acknowledgeAll(controller)
+        deliver([0x57, 1, 0xA2, 6] + raw, to: controller)
+        XCTAssertNil(controller.pendingChanges[.equalizer])
+        XCTAssertNil(controller.settingErrors[.equalizer])
+        XCTAssertEqual(controller.equalizerPreset?.rawValue, 0xA2)
+        XCTAssertEqual(controller.equalizer.settings, curve)
+    }
+
     func testLegacyPauseMetadataRequiresActualReadsAndMatchingKnownType() {
         let controller = beginWearingController()
         defer { controller.simulateControlLoss() }

@@ -64,6 +64,15 @@ struct EqualizerEditorView: View {
                     apply(draft)
                 }
                     .tint(.primary)
+                ForEach(savableSlots, id: \.self) { slot in
+                    Button(String(localized: "Save to \(slotTitle(slot))")) {
+                        headphones.saveEqualizerCurve(settings.customEqualizerDraft, toSlot: slot)
+                    }
+                    .disabled(!canSave(to: slot))
+                    .tint(.primary)
+                    .help("Store this curve in the headphone preset so it survives without this Mac.")
+                    .accessibilityIdentifier("equalizer.save.\(slot)")
+                }
             }
             Section {
                 HStack {
@@ -144,6 +153,24 @@ struct EqualizerEditorView: View {
         canRead && headphones.equalizer.settingsPayload(settings.customEqualizerDraft) != nil
     }
 
+    private var savableSlots: [UInt8] { headphones.isReady ? headphones.equalizer.savableSlots : [] }
+
+    private func slotTitle(_ slot: UInt8) -> String {
+        EqualizerPreset(rawValue: slot)?.title ?? String(format: String(localized: "Preset %02X"), slot)
+    }
+
+    private func canSave(to slot: UInt8) -> Bool {
+        canRead && headphones.equalizer.curvePayload(settings.customEqualizerDraft, target: slot) != nil
+            && !headphones.isEqualizerUpdatePending && headphones.pendingChanges[.equalizerReadback] == nil
+    }
+
+    private var savedSlot: UInt8? {
+        guard let id = headphones.equalizer.presetID, EqualizerPreset(rawValue: id) != .manual,
+              SonyEqualizer.userSlots.contains(id),
+              headphones.equalizer.settings == settings.customEqualizerDraft else { return nil }
+        return id
+    }
+
     private var isApplied: Bool {
         headphones.equalizerPreset == .manual && headphones.equalizer.settings == settings.customEqualizerDraft
     }
@@ -171,6 +198,8 @@ struct EqualizerEditorView: View {
                     Text("Custom equalizer controls are not available for this device.")
                 } else if !canApply {
                     Text("This draft uses a different equalizer layout. Sync to use this device’s settings.")
+                } else if let savedSlot {
+                    Text("Saved to \(slotTitle(savedSlot)).")
                 } else if isApplied {
                     Text("Applied to headphones.")
                 } else {

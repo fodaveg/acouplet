@@ -1057,7 +1057,7 @@ final class SonyEqualizerControllerTests: XCTestCase {
             [$0.informationType, UInt8($0.value >> 8), UInt8($0.value & 0xFF)]
         }
         deliver([0x5B, 0, 10] + metadata, to: controller)
-        deliver([0x57, 0, 0x30, 0], to: controller)
+        deliver([0x57, 0, 0xA0, 0], to: controller)
         controller.setCustomEqualizer(.flat)
         XCTAssertNotNil(controller.settingErrors[.equalizer])
         XCTAssertFalse(controller.isEqualizerUpdatePending)
@@ -1078,11 +1078,12 @@ final class SonyEqualizerControllerTests: XCTestCase {
     @MainActor
     func testManualEqualizerRequiresACompleteMatchingTransmittedReadback() async throws {
         let controller = makeController()
+        deliver([0x57, 0, 0xA0, 0], to: controller)
         let settings = EqualizerSettings(clearBass: 10, bands: [-10, -4, 0, 6, 10])
         controller.refreshEqualizer()
         controller.setCustomEqualizer(settings)
         XCTAssertTrue(controller.isEqualizerUpdatePending)
-        XCTAssertEqual(controller.equalizerPreset, .bassBoost)
+        XCTAssertEqual(controller.equalizerPreset, .manual)
         XCTAssertEqual(controller.customEqualizer, .flat)
         try await Task.sleep(for: .milliseconds(180))
         XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x56, 0x00])
@@ -1115,6 +1116,7 @@ final class SonyEqualizerControllerTests: XCTestCase {
     @MainActor
     func testRapidEditsKeepOnePendingWriteAndOnlyTheLatestDraft() async throws {
         let controller = makeController()
+        deliver([0x57, 0, 0xA0, 0], to: controller)
         let first = EqualizerSettings(clearBass: 1, bands: [1, 0, 0, 0, 0])
         let skipped = EqualizerSettings(clearBass: 3, bands: [2, 0, 0, 0, 0])
         let latest = EqualizerSettings(clearBass: 5, bands: [4, 0, 0, 0, 0])
@@ -1180,6 +1182,7 @@ final class SonyEqualizerControllerTests: XCTestCase {
     @MainActor
     func testExplicitSyncRequiresAValidReplyAndSerializesLaterEdits() async throws {
         let controller = makeController()
+        deliver([0x57, 0, 0xA0, 0], to: controller)
         controller.refreshEqualizer(trackConfirmation: true)
         acknowledgeSimulatedCommands(controller)
         let originalReadback = controller.equalizerReadbackID
@@ -1272,6 +1275,7 @@ final class SonyEqualizerControllerTests: XCTestCase {
     @MainActor
     func testDisconnectCancelsDebouncePendingRequestsAndAutomaticReplay() async throws {
         let controller = makeController()
+        deliver([0x57, 0, 0xA0, 0], to: controller)
         let settings = EqualizerSettings(clearBass: 4, bands: [1, 2, 3, 4, 5])
         controller.setCustomEqualizer(settings)
         controller.simulateDeviceConnection(named: nil)
@@ -1294,6 +1298,107 @@ final class SonyEqualizerControllerTests: XCTestCase {
         XCTAssertTrue(controller.pendingChanges.isEmpty)
         XCTAssertTrue(controller.settingErrors.isEmpty)
         XCTAssertEqual(controller.equalizerPreset, .bassBoost)
+    }
+
+    @MainActor
+    private func makeSlotController(active: UInt8 = 0x16) -> SonyHeadphonesController {
+        let controller = makeController()
+        deliver([0x51, 0, 6, 21, 4, 0x16, 0, 0xA0, 0, 0xA1, 0, 0xA2, 0], to: controller)
+        deliver([0x57, 0, active, 0], to: controller)
+        acknowledgeSimulatedCommands(controller)
+        return controller
+    }
+
+    private var slotCurve: EqualizerSettings { EqualizerSettings(clearBass: 10, bands: [-10, -4, 0, 6, 10]) }
+    private let slotRaw: [UInt8] = [20, 0, 6, 10, 16, 20]
+
+    @MainActor
+    func testSavingToUser1SelectsTheSlotBeforeWritingAndConfirmsByRereading() throws {
+        for slot: UInt8 in [0xA1, 0xA2] {
+            let controller = makeSlotController()
+            XCTAssertEqual(controller.equalizer.savableSlots, [0xA1, 0xA2])
+            let sent = controller.simulatedTransmittedFrames.count
+            controller.saveEqualizerCurve(slotCurve, toSlot: slot)
+            // 58 00 Ax 00 goes out alone; no values until the slot is confirmed.
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x58, 0, slot, 0])
+            XCTAssertEqual(controller.simulatedTransmittedFrames.dropFirst(sent).filter { $0.payload.count > 4 }.count, 0)
+            acknowledgeSimulatedCommands(controller)
+            XCTAssertTrue(controller.isEqualizerUpdatePending)
+            deliver([0x59, 0, slot, 0], to: controller)
+            let write: [UInt8] = [0x58, 0, slot, 6] + slotRaw
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, write)
+            acknowledgeSimulatedCommands(controller)
+            XCTAssertNotNil(controller.pendingChanges[.equalizer])
+            // The re-read of that slot is what confirms the save.
+            controller.refreshEqualizer()
+            acknowledgeSimulatedCommands(controller)
+            deliver([0x57, 0, slot, 6] + slotRaw, to: controller)
+            XCTAssertFalse(controller.isEqualizerUpdatePending)
+            XCTAssertNil(controller.settingErrors[.equalizer])
+            XCTAssertEqual(controller.equalizerPreset.map(\.rawValue), slot)
+            XCTAssertEqual(controller.equalizer.settings, slotCurve)
+            XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload.first == 0x58 }.count, 2)
+        }
+    }
+
+    @MainActor
+    func testSlotSaveIsNotConfirmedByAMismatchingRereadAndReportsTheError() async {
+        let controller = makeSlotController()
+        controller.saveEqualizerCurve(slotCurve, toSlot: 0xA1)
+        acknowledgeSimulatedCommands(controller)
+        deliver([0x59, 0, 0xA1, 0], to: controller)
+        acknowledgeSimulatedCommands(controller)
+        controller.refreshEqualizer()
+        acknowledgeSimulatedCommands(controller)
+        deliver([0x57, 0, 0xA1, 6, 10, 10, 10, 10, 10, 10], to: controller)
+        XCTAssertNotNil(controller.pendingChanges[.equalizer])
+        controller.simulateSettingTimeout(.equalizer)
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertEqual(controller.settingErrors[.equalizer], "Headphones did not confirm the change.")
+        XCTAssertNotEqual(controller.equalizer.settings, slotCurve)
+    }
+
+    @MainActor
+    func testSlotSaveIsRefusedWhenTheHeadphonesDoNotAdvertiseTheSlot() {
+        let controller = makeController()
+        XCTAssertEqual(controller.equalizer.savableSlots, [])
+        let sent = controller.simulatedTransmittedFrames.count
+        controller.saveEqualizerCurve(slotCurve, toSlot: 0xA1)
+        XCTAssertNil(controller.simulatedPendingFrame)
+        XCTAssertEqual(controller.simulatedTransmittedFrames.count, sent)
+        XCTAssertFalse(controller.isEqualizerUpdatePending)
+    }
+
+    @MainActor
+    func testManualCurveSelectsManualFirstWhenAUserSlotIsActive() async throws {
+        for active: UInt8 in [0xA1, 0x16] {
+            let controller = makeSlotController(active: active)
+            controller.setCustomEqualizer(slotCurve)
+            try await Task.sleep(for: .milliseconds(180))
+            // Writing to A0 while User 1 is active would store the curve in Manual without activating it.
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x58, 0, 0xA0, 0])
+            XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload.count > 4 && $0.payload.first == 0x58 }.count, 0)
+            acknowledgeSimulatedCommands(controller)
+            deliver([0x59, 0, 0xA0, 0], to: controller)
+            XCTAssertEqual(controller.simulatedPendingFrame?.payload, [0x58, 0, 0xA0, 6] + slotRaw)
+            acknowledgeSimulatedCommands(controller)
+            deliver([0x59, 0, 0xA0, 6] + slotRaw, to: controller)
+            XCTAssertFalse(controller.isEqualizerUpdatePending)
+            XCTAssertEqual(controller.equalizerPreset, .manual)
+        }
+    }
+
+    @MainActor
+    func testManualCurveSelectionFailureDropsTheWaitingCurve() async throws {
+        let controller = makeSlotController(active: 0xA1)
+        controller.setCustomEqualizer(slotCurve)
+        acknowledgeSimulatedCommands(controller)
+        controller.simulateSettingTimeout(.equalizer)
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertNotNil(controller.settingErrors[.equalizer])
+        deliver([0x59, 0, 0xA0, 0], to: controller)
+        XCTAssertNil(controller.simulatedPendingFrame)
+        XCTAssertEqual(controller.simulatedTransmittedFrames.filter { $0.payload.count > 4 && $0.payload.first == 0x58 }.count, 0)
     }
 
     @MainActor

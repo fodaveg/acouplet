@@ -9753,6 +9753,23 @@
         }
       }
     },
+    "Save to %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ içine kaydet"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save to %@"
+          }
+        }
+      }
+    },
     "Saved": {
       "extractionState": "manual",
       "localizations": {
@@ -9766,6 +9783,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "Saved"
+          }
+        }
+      }
+    },
+    "Saved to %@.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ içine kaydedildi."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saved to %@."
           }
         }
       }
@@ -10855,6 +10889,23 @@
           "stringUnit": {
             "state": "translated",
             "value": "Surround (VPT)"
+          }
+        }
+      }
+    },
+    "Store this curve in the headphone preset so it survives without this Mac.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bu eğriyi kulaklığın önayarına kaydeder; Mac olmadan da korunur."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Store this curve in the headphone preset so it survives without this Mac."
           }
         }
       }

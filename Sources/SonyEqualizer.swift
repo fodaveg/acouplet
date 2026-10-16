@@ -145,16 +145,35 @@ struct SonyEqualizer: Equatable, Sendable {
                                  values: rawValues.map { Int($0) - center })
     }
 
+    /// Presets that store a curve of their own: Manual plus the two user slots the Mac can fill.
+    static let userSlots: [UInt8] = [EqualizerPreset.user1.rawValue, EqualizerPreset.user2.rawValue]
+
+    private static func isCurveTarget(_ id: UInt8) -> Bool {
+        id == EqualizerPreset.manual.rawValue || userSlots.contains(id)
+    }
+
+    private var supportsCurveWrite: Bool {
+        canSelectPreset && (generation == .v1 ? inquiryType == 1 : inquiryType != 2) && flatSettings != nil
+    }
+
+    private func advertises(_ preset: UInt8) -> Bool {
+        capabilities?.presets.contains { $0.id == preset } == true
+    }
+
     var canEdit: Bool {
-        canSelectPreset && (generation == .v1 ? inquiryType == 1 && presetID == EqualizerPreset.manual.rawValue : inquiryType != 2 && presetID != nil)
-            && flatSettings != nil
-            && capabilities?.presets.contains { $0.id == EqualizerPreset.manual.rawValue } == true
+        supportsCurveWrite && (generation == .v1 ? presetID == EqualizerPreset.manual.rawValue : presetID != nil)
+            && advertises(EqualizerPreset.manual.rawValue)
+    }
+
+    /// User slots the headphones advertise and that accept a curve in the current state.
+    var savableSlots: [UInt8] {
+        supportsCurveWrite ? Self.userSlots.filter(advertises) : []
     }
 
     var requiresManualSelection: Bool {
         generation == .v1 && inquiryType == 1 && canSelectPreset && flatSettings != nil
             && presetID != EqualizerPreset.manual.rawValue
-            && capabilities?.presets.contains { $0.id == EqualizerPreset.manual.rawValue } == true
+            && advertises(EqualizerPreset.manual.rawValue)
     }
 
     func presetPayload(_ preset: UInt8) -> [UInt8]? {
@@ -164,12 +183,20 @@ struct SonyEqualizer: Equatable, Sendable {
     }
 
     func settingsPayload(_ settings: EqualizerSettings) -> [UInt8]? {
-        guard canEdit, let inquiryType, let flatSettings,
+        guard canEdit else { return nil }
+        return curvePayload(settings, target: EqualizerPreset.manual.rawValue)
+    }
+
+    /// Curve write for `target` (Manual or a user slot). It only builds the bytes: the target must
+    /// be selected and confirmed first, and `acceptsSetPayload` enforces that when the frame is sent.
+    /// v1 always writes to `FF` and relies on the selected slot; v2 names the slot.
+    func curvePayload(_ settings: EqualizerSettings, target: UInt8) -> [UInt8]? {
+        guard supportsCurveWrite, Self.isCurveTarget(target), advertises(target), let inquiryType, let flatSettings,
               settings.layout == flatSettings.layout, settings.levelSteps == flatSettings.levelSteps,
               settings.values.count == flatSettings.layout.count, let range = settings.levelRange,
               settings.values.allSatisfy(range.contains) else { return nil }
         let center = range.upperBound
-        return [0x58, inquiryType, generation == .v1 ? 0xFF : EqualizerPreset.manual.rawValue, UInt8(settings.values.count)]
+        return [0x58, inquiryType, generation == .v1 ? 0xFF : target, UInt8(settings.values.count)]
             + settings.values.map { UInt8($0 + center) }
     }
 
@@ -177,19 +204,20 @@ struct SonyEqualizer: Equatable, Sendable {
         guard payload.count >= 4, payload[0] == 0x58, payload[1] == inquiryType,
               payload.count == 4 + Int(payload[3]) else { return false }
         if payload[3] == 0 { return presetPayload(payload[2]) == payload }
-        guard payload[2] == (generation == .v1 ? 0xFF : EqualizerPreset.manual.rawValue), let flatSettings,
+        guard payload[2] == (generation == .v1 ? 0xFF : presetID ?? 0), let target = presetID,
+              Self.isCurveTarget(target), let flatSettings,
               payload[3] == flatSettings.layout.count else { return false }
         let center = (Int(flatSettings.levelSteps) - 1) / 2
         let settings = EqualizerSettings(layout: flatSettings.layout, levelSteps: flatSettings.levelSteps,
                                          values: payload.dropFirst(4).map { Int($0) - center })
-        return settingsPayload(settings) == payload
+        return curvePayload(settings, target: target) == payload
     }
 
     func confirmationValue(_ payload: [UInt8]) -> [UInt8] {
         if generation == .v1, payload[0] == 0x58, payload[2] == 0xFF, payload[3] != 0 {
-            return [EqualizerPreset.manual.rawValue] + payload.dropFirst(3)
+            return [presetID ?? EqualizerPreset.manual.rawValue] + payload.dropFirst(3)
         }
-        return payload[2] == EqualizerPreset.manual.rawValue && payload[3] != 0 ? Array(payload.dropFirst(2)) : [payload[2]]
+        return Self.isCurveTarget(payload[2]) && payload[3] != 0 ? Array(payload.dropFirst(2)) : [payload[2]]
     }
 
     @discardableResult
